@@ -35,7 +35,10 @@ import urllib.request
 
 import torch
 
-from core_eval import evaluate_task
+try:
+    from core_eval import evaluate_task
+except ImportError:
+    from eval.core_eval import evaluate_task
 
 # =============================================================================
 # Constants
