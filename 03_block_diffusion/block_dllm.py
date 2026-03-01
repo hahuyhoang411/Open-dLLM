@@ -204,6 +204,87 @@ def apply_rotary_emb(x, cos, sin):
 
 
 # ============================================================================
+# Staircase Attention Mask                                               [NEW]
+# ============================================================================
+# The core innovation of BD3-LMs. For a doubled training sequence [x_t || x_0]
+# of length 2n, the mask controls information flow:
+#
+#   M_BD  (block-diagonal):      same block, same half -> bidirectional
+#   M_OBC (offset block-causal): x_t attends to x_0 from EARLIER blocks
+#   M_BC  (block-causal):        x_0 attends to x_0 causally (current + earlier)
+#
+# Returns float tensor (2n, 2n): 0.0 where allowed, -inf where blocked.
+
+def build_staircase_mask(seq_len, block_size_blk):
+    n = seq_len
+    total = 2 * n
+
+    pos = torch.arange(total)
+    q = pos.unsqueeze(1)   # (2n, 1)
+    kv = pos.unsqueeze(0)  # (1, 2n)
+
+    x0_flag_q = (q >= n)
+    x0_flag_kv = (kv >= n)
+
+    block_q = (q % n) // block_size_blk
+    block_kv = (kv % n) // block_size_blk
+
+    # M_BD: same block, same half — full bidirectional within a block
+    m_bd = (block_q == block_kv) & (x0_flag_q == x0_flag_kv)
+
+    # M_OBC: x_t queries attend to x_0 keys from current or earlier blocks
+    m_obc = (block_q >= block_kv) & x0_flag_kv & ~x0_flag_q
+
+    # M_BC: x_0 queries attend to x_0 keys from current or earlier blocks
+    m_bc = (block_q >= block_kv) & x0_flag_kv & x0_flag_q
+
+    allow = m_bd | m_obc | m_bc
+    mask = torch.where(allow, 0.0, float('-inf'))
+    return mask
+
+
+def _visualize_mask(mask, seq_len):
+    """Debug helper: print (2n, 2n) mask as a character grid."""
+    n = seq_len
+    total = 2 * n
+    assert mask.shape == (total, total)
+
+    num_blocks = (n + block_size_blk - 1) // block_size_blk
+
+    # Column header
+    halves = ["x_t", "x_0"]
+    header_half = "         "
+    header_blk = "         "
+    for half in halves:
+        span = n
+        pad = span // 2 - len(half) // 2
+        header_half += " " * pad + half + " " * (span - pad - len(half))
+    print(header_half)
+
+    for half in halves:
+        for b in range(num_blocks):
+            label = f"b{b}"
+            blen = min(block_size_blk, n - b * block_size_blk)
+            pad = blen // 2 - len(label) // 2
+            header_blk += " " * pad + label + " " * (blen - pad - len(label))
+    print(header_blk)
+
+    # Rows
+    for r in range(total):
+        half = "x_t" if r < n else "x_0"
+        b_idx = (r % n) // block_size_blk
+        pos_in_blk = (r % n) % block_size_blk
+        if pos_in_blk == 0:
+            label = f"{half} b{b_idx}: "
+        else:
+            label = "         "
+        row_chars = ""
+        for c in range(total):
+            row_chars += "." if mask[r, c] == 0.0 else "X"
+        print(label + row_chars)
+
+
+# ============================================================================
 # Multi-Head Attention                                                  [DIFF 2]
 # ============================================================================
 #
@@ -485,3 +566,22 @@ class Model(nn.Module):
                 loss = per_token_loss.mean()
 
         return logits, loss
+
+
+# ============================================================================
+# Mask Verification (debug only)
+# ============================================================================
+
+if __name__ == "__main__" and not args.train and args.prompt is None:
+    print("=== Staircase Mask Verification ===")
+    print(f"seq_len=8, block_size_blk=4 (2 blocks)\n")
+    test_mask = build_staircase_mask(seq_len=8, block_size_blk=4)
+    assert test_mask.shape == (16, 16), f"Expected (16, 16), got {test_mask.shape}"
+    # Temporarily override global for visualization label formatting
+    _saved_blk = block_size_blk
+    block_size_blk = 4
+    _visualize_mask(test_mask, seq_len=8)
+    block_size_blk = _saved_blk
+    print(f"\nMask shape: {test_mask.shape}")
+    print(f"Allowed entries: {(test_mask == 0.0).sum().item()}")
+    print(f"Blocked entries: {(test_mask == float('-inf')).sum().item()}")
