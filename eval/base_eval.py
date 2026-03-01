@@ -193,9 +193,21 @@ def run_core(model_fn, tokenize_fn, device, mode, mask_token_id,
     with open(os.path.join(bundle_dir, "eval_meta_data.csv")) as f:
         reader = csv.DictReader(f)
         for row in reader:
-            baselines[row["benchmark_name"]] = float(row["Random baseline"])
+            baselines[row["Eval Task"]] = float(row["Random baseline"])
 
-    tasks = task_config["tasks"]
+    # Build task list: normalize icl_tasks list into (name, meta) pairs
+    # YAML has: label, dataset_uri, num_fewshot (list), icl_task_type, continuation_delimiter
+    # core_eval expects: task_type, continuation_delimiter, num_fewshot (int)
+    tasks = []
+    for entry in task_config["icl_tasks"]:
+        task_meta = {
+            "task_type": entry["icl_task_type"],
+            "dataset_uri": entry["dataset_uri"],
+            "num_fewshot": entry["num_fewshot"][0],  # YAML stores as list [N]
+            "continuation_delimiter": entry.get("continuation_delimiter", " "),
+        }
+        tasks.append((entry["label"], task_meta))
+
     results = {}
     centered_scores = []
 
@@ -207,7 +219,7 @@ def run_core(model_fn, tokenize_fn, device, mode, mask_token_id,
     print("=" * 60)
     print()
 
-    for task_name, task_meta in tasks.items():
+    for task_name, task_meta in tasks:
         dataset_uri = task_meta["dataset_uri"]
         data_path = os.path.join(bundle_dir, "eval_data", dataset_uri)
 
@@ -264,7 +276,7 @@ def run_core(model_fn, tokenize_fn, device, mode, mask_token_id,
     print("=" * 60)
     print(f"{'Task':34s} | {'Acc':>6s} | {'Centered':>8s}")
     print("-" * 34 + "-+-" + "-" * 6 + "-+-" + "-" * 8)
-    for task_name in tasks:
+    for task_name, _ in tasks:
         r = results[task_name]
         print(f"{task_name:34s} | {r['accuracy']:.4f} | {r['centered_accuracy']:>8.4f}")
     print("-" * 34 + "-+-" + "-" * 6 + "-+-" + "-" * 8)
