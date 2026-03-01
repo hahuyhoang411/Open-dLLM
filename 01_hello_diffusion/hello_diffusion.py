@@ -1,5 +1,5 @@
 """
-hello_diffusion.py — A ~400-line diffusion language model from scratch.
+hello_diffusion.py — A diffusion language model from scratch.
 
 This is a character-level masked diffusion model trained on Tiny Shakespeare.
 It is a GPT with exactly 5 surgical modifications, each marked with [DIFF].

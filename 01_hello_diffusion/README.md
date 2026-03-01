@@ -1,6 +1,6 @@
 # Phase 1: Hello Diffusion
 
-**The simplest possible diffusion language model, in ~400 lines of annotated Python.**
+**The simplest possible diffusion language model, in ~640 lines of annotated Python.**
 
 ---
 
@@ -130,9 +130,9 @@ vocab_size = len(chars)                        # 65
 
 # dLLM: add a mask token at position 0                          [DIFF 1]
 MASK_TOKEN = "_"
-chars = [MASK_TOKEN] + sorted(set(text) - {MASK_TOKEN})
+chars = ["_"] + sorted(set(text))
 MASK_ID = 0
-vocab_size = len(chars)                        # 65 (mask replaces underscore)
+vocab_size = len(chars)                        # 66 (65 chars + mask token)
 ```
 
 The mask token is just another token in the vocabulary. Nothing special
