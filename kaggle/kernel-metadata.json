@@ -1,0 +1,14 @@
+{
+  "id": "hhoang41/open-dllm-phase2-training",
+  "title": "Open-dLLM Phase 2 Training",
+  "code_file": "train_phase2.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_internet": true,
+  "dataset_sources": [],
+  "kernel_sources": [],
+  "competition_sources": [],
+  "model_sources": []
+}
