@@ -344,7 +344,7 @@ examples:
         if weights_path is None:
             repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
             weights_path = os.path.join(
-                repo_root, "02_nano_dllm", "weights", f"dllm_d{args.depth}.pt"
+                repo_root, "02_nano_dllm", "weights", f"nano_dllm_d{args.depth}.pt"
             )
         model_fn, tokenize_fn, mask_token_id, max_seq_len = load_dllm_model(
             args.depth, weights_path, device
