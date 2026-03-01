@@ -1,0 +1,15 @@
+[project]
+name = "open-dllm"
+version = "0.1.0"
+description = "Learn diffusion language models from scratch, one phase at a time"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.0.0",
+]
+
+[project.optional-dependencies]
+phase2 = [
+    "datasets>=2.0.0",
+    "tokenizers>=0.15.0",
+]
