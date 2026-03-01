@@ -136,9 +136,9 @@ def encode(s):
     return [stoi[ch] for ch in s]
 
 
-def decode(l):
+def decode(tokens):
     """List of integers -> string."""
-    return "".join([itos[n] for n in l])
+    return "".join([itos[n] for n in tokens])
 
 
 # Train/val split (90/10)
@@ -570,7 +570,7 @@ def generate(model, max_new_tokens, prompt_len=16, temp=1.0,
 def estimate_loss(model):
     """Estimate train and val loss by averaging over eval_iters batches."""
     out = {}
-    model.training = False
+    model.eval()
     for split in ["train", "val"]:
         losses = torch.zeros(eval_iters)
         for k in range(eval_iters):
@@ -578,7 +578,7 @@ def estimate_loss(model):
             _, loss = model(X, Y, M)
             losses[k] = loss.item()
         out[split] = losses.mean()
-    model.training = True
+    model.train()
     return out
 
 
@@ -588,7 +588,8 @@ def estimate_loss(model):
 
 if __name__ == "__main__":
     train_flag = "--train" in sys.argv
-    weights_path = "weights/diffusion.pt"
+    script_dir = os.path.dirname(__file__) or "."
+    weights_path = os.path.join(script_dir, "weights", "diffusion.pt")
     os.makedirs(os.path.dirname(weights_path), exist_ok=True)
 
     model = Model()
