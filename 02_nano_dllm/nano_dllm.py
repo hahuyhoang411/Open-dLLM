@@ -599,3 +599,198 @@ class Model(nn.Module):
                 loss = per_token_loss.mean()
 
         return logits, loss
+
+
+# ============================================================================
+# Generation: Confidence-Based Parallel Decoding                       [DIFF 5]
+# ============================================================================
+#
+# Same algorithm as Phase 1, adapted for BPE tokenization.
+# Instead of characters, we now decode BPE subwords — the fundamental
+# difference is that each decoded position represents a subword piece,
+# not a single character. A single "word" may span multiple positions.
+#
+# Generation Process (Iterative Unmasking)
+# =========================================
+#
+#   Start:  [prompt tokens] [_] [_] [_] [_] [_] [_] [_] [_]
+#           (each [_] is a masked BPE subword position)
+#
+#   Step 1: Forward pass -> logits at all positions
+#           Softmax/temp -> probabilities
+#           Zero out mask_token_id prob (model should never "generate" [MASK])
+#           Top-k probs -> confidence = sum(top_k_probs)
+#
+#           Position:  prompt  p+1  p+2  p+3  p+4  p+5  p+6  p+7  p+8
+#           Confidence:  --   0.92 0.97 0.45 0.98 0.88 0.71 0.96 0.55
+#           Threshold:                        0.95
+#           Decode?:     --    no   YES   no   YES  no   no   YES  no
+#
+#           After:  [prompt] [_] [▁the] [_] [▁of] [_] [_] [▁and] [_]
+#                                  ^          ^                ^
+#                             3 BPE tokens decoded in one step!
+#
+#   Step 2: Re-run model with updated context...
+#           Now more positions become confident (they see neighbors)
+#
+#           After:  [prompt] [▁mean] [▁the] [_] [▁of] [_] [▁is] [▁and] [▁it]
+#
+#   Step 3: ...continue until all masks are filled...
+#
+#   Result: [prompt] [▁mean] [▁the] [▁world] [▁of] [▁life] [▁is] [▁and] [▁it]
+#
+# If NO position exceeds the threshold, we force-decode the SINGLE most
+# confident position to guarantee progress.
+
+@torch.no_grad()
+def generate(model, max_new_tokens=512, prompt=None, temp=0.8,
+             confidence_threshold=0.95, top_k=5):
+    """
+    Generate text using confidence-based parallel decoding with BPE.
+
+    Args:
+        model: the diffusion language model
+        max_new_tokens: how many new BPE tokens to generate
+        prompt: text string to use as context (None = start from all masks)
+        temp: sampling temperature (lower = more deterministic)
+        confidence_threshold: minimum confidence to unmask a position
+        top_k: number of top candidates to consider for sampling
+    """
+    was_training = model.training
+    model.eval()  # noqa: B018
+
+    # Encode prompt to BPE token IDs
+    if prompt is not None:
+        prompt_ids = encode(prompt)
+    else:
+        prompt_ids = []
+
+    prompt_len = len(prompt_ids)
+    all_tokens = list(prompt_ids)
+    total_steps = 0
+    t_start = time.time()
+
+    # Generate one block at a time (for sequences longer than block_size)
+    while len(all_tokens) - prompt_len < max_new_tokens:
+        # How many tokens to generate in this block
+        block_len = min(
+            block_size - prompt_len,
+            prompt_len + max_new_tokens - len(all_tokens),
+        )
+
+        # Initialize: prompt + all masks within block_size window
+        x = torch.full((1, block_size), mask_token_id, dtype=torch.long, device=device)
+        if prompt_len > 0:
+            x[0, :prompt_len] = torch.tensor(
+                all_tokens[-prompt_len:], dtype=torch.long, device=device
+            )
+
+        # Track which positions still need decoding
+        masked = torch.zeros(1, block_size, dtype=torch.bool, device=device)
+        masked[0, prompt_len : prompt_len + block_len] = True
+
+        # Iterative unmasking loop
+        while masked.any():
+            total_steps += 1
+
+            # 1. Forward pass to get predictions
+            logits, _ = model(x)
+            probs = F.softmax(logits / temp, dim=-1)
+
+            # Zero out mask_token_id probability — the model should never
+            # "generate" a [MASK] token during decoding
+            probs[:, :, mask_token_id] = 0.0
+
+            # 2. Get top-k candidates and compute confidence
+            top_k_probs, top_k_indices = torch.topk(probs, k=top_k, dim=-1)
+            confidences = top_k_probs.sum(dim=-1)  # Confidence = P(top_k)
+
+            # 3. Decide which masked positions to decode
+            decode_mask = (confidences >= confidence_threshold) & masked
+
+            # 4. If nothing exceeds threshold, force-decode the best one
+            if not decode_mask.any():
+                masked_confidences = torch.where(
+                    masked, confidences, torch.tensor(-float("inf"), device=device)
+                )
+                decode_mask.view(-1)[masked_confidences.argmax()] = True
+
+            # 5. Sample from normalized top-k distribution
+            top_k_probs_norm = top_k_probs / top_k_probs.sum(dim=-1, keepdim=True)
+            sampled_k = torch.multinomial(
+                top_k_probs_norm.view(-1, top_k), 1
+            ).view(1, block_size)
+            sampled_tokens = torch.gather(
+                top_k_indices, -1, sampled_k.unsqueeze(-1)
+            ).squeeze(-1)
+
+            # 6. Update: place sampled tokens, clear mask at decoded positions
+            x = torch.where(decode_mask, sampled_tokens, x)
+            masked = masked & ~decode_mask
+
+        # Extract generated tokens from this block
+        all_tokens.extend(x[0, prompt_len : prompt_len + block_len].tolist())
+
+    # Decode full sequence with BPE tokenizer
+    tokens_generated = len(all_tokens) - prompt_len
+    elapsed = time.time() - t_start
+    tok_per_sec = tokens_generated / elapsed if elapsed > 0 else float("inf")
+    avg_per_step = tokens_generated / total_steps if total_steps > 0 else 0
+
+    print(f"Generation stats: {total_steps} steps, {tokens_generated} tokens, "
+          f"{avg_per_step:.1f} avg decoded/step, {tok_per_sec:.1f} tok/s")
+
+    if was_training:
+        model.train()
+    return decode(all_tokens)
+
+
+# ============================================================================
+# Evaluation
+# ============================================================================
+
+@torch.no_grad()
+def estimate_loss(model):
+    """Estimate train and val loss by averaging over eval_iters batches."""
+    out = {}
+    was_training = model.training
+    model.eval()  # noqa: B018
+    for split in ["train", "val"]:
+        losses = torch.zeros(eval_iters)
+        for k in range(eval_iters):
+            x, targets, mask, t = get_batch(split)
+            _, loss = model(x, targets, mask, t)
+            losses[k] = loss.item()
+        out[split] = losses.mean().item()
+    if was_training:
+        model.train()
+    return out
+
+
+# ============================================================================
+# Learning Rate Schedule: Cosine Decay with Warmup                     [NEW 6]
+# ============================================================================
+#
+#     Learning Rate Schedule
+#     ======================
+#     lr
+#     1e-3 |     ********
+#          |    *         *****
+#          |   *                ****
+#          |  *                     ***
+#     1e-4 | *                         **
+#          +--|---------|---------|------->
+#          0  warmup    mid       max_iters
+#
+# Linear warmup from 0 -> learning_rate over warmup_iters steps,
+# then cosine decay from learning_rate -> min_lr over the remaining steps.
+
+def get_lr(step):
+    """Return the learning rate for a given training step."""
+    # Linear warmup
+    if step < warmup_iters:
+        return learning_rate * (step + 1) / warmup_iters
+    # Cosine decay
+    decay_ratio = (step - warmup_iters) / (max_iters - warmup_iters)
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
+    return min_lr + coeff * (learning_rate - min_lr)
