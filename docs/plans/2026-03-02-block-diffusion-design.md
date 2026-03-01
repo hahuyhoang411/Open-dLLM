@@ -14,7 +14,7 @@ Build a block diffusion language model that bridges autoregressive and diffusion
 - KV caching across blocks for inference
 - Variable-length generation (EOS-driven block termination)
 - Configurable `--block-size {1,4,8,16,full}` CLI flag
-- Qwen 3.5 tokenizer (production tokenizer, ~150K vocab)
+- Qwen 3 tokenizer via `Qwen/Qwen3-0.6B` (152K vocab, add [MASK] as special token)
 - Tied embeddings (input + output share weights)
 - Single file: `03_block_diffusion/block_dllm.py`
 - FineWeb-Edu streaming data (same as Phase 2)
