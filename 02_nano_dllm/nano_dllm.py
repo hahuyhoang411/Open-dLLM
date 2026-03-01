@@ -794,3 +794,140 @@ def get_lr(step):
     decay_ratio = (step - warmup_iters) / (max_iters - warmup_iters)
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
     return min_lr + coeff * (learning_rate - min_lr)
+
+
+# ============================================================================
+# Main: Training and Generation
+# ============================================================================
+#
+# Training Loop
+# =============
+#
+#   FineWeb-Edu (streaming)
+#        |
+#        v
+#   get_batch() -> (x, targets, mask, t)
+#        |
+#        v
+#   model(x, targets, mask, t) -> loss
+#        |              [DIFF 4] masked positions
+#        v              [NEW 3] ELBO weighted by 1/t
+#   loss.backward()
+#        |
+#        v
+#   clip_grad_norm + optimizer.step()
+#        |
+#        v
+#   repeat max_iters times
+#
+# The training loop follows a standard recipe:
+#   1. Sample a batch of tokenized documents from FineWeb-Edu
+#   2. Apply cosine noise schedule: sample t, mask tokens with probability 1-cos^2(t*pi/2)
+#   3. Forward pass through the model -> ELBO-weighted cross-entropy loss
+#   4. Backward pass + gradient clipping + optimizer step
+#   5. Periodically evaluate on held-out data and generate a sample
+#
+# Weight decay is applied only to 2D+ parameters (weight matrices), not to
+# biases or normalization parameters (1D). This is standard practice: decaying
+# biases and norms hurts training stability with no regularization benefit.
+
+if __name__ == "__main__":
+
+    # --- 1. Print configuration ---
+    print("=" * 60)
+    print("nano_dllm — BPE diffusion language model")
+    print("=" * 60)
+    print(f"  depth      = {depth}")
+    print(f"  n_layer    = {n_layer}")
+    print(f"  n_embd     = {n_embd}")
+    print(f"  n_head     = {n_head}")
+    print(f"  block_size = {block_size}")
+    print(f"  vocab_size = {vocab_size}")
+    print(f"  device     = {device}")
+    print("=" * 60)
+
+    # --- 2. Set up weights path ---
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    weights_path = os.path.join(script_dir, "weights", f"nano_dllm_d{depth}.pt")
+    os.makedirs(os.path.dirname(weights_path), exist_ok=True)
+
+    # --- 3. Instantiate model ---
+    model = Model().to(device)
+    param_count = sum(p.numel() for p in model.parameters())
+    print(f"{param_count / 1e6:.2f}M parameters")
+
+    # --- 4. Load or train ---
+    if os.path.exists(weights_path) and not args.train:
+        # Load pre-trained weights
+        model.load_state_dict(torch.load(weights_path, map_location=device, weights_only=True))
+        print(f"Loaded weights from {weights_path}")
+
+    elif args.train:
+        # Train from scratch
+
+        # Separate parameters into decay (2D+ weight matrices) and no-decay
+        # (biases, norm params). Weight decay on biases/norms hurts stability.
+        decay_params = [p for p in model.parameters() if p.dim() >= 2]
+        no_decay_params = [p for p in model.parameters() if p.dim() < 2]
+        optim_groups = [
+            {"params": decay_params, "weight_decay": weight_decay},
+            {"params": no_decay_params, "weight_decay": 0.0},
+        ]
+        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95))
+
+        # Training loop
+        t0 = time.time()
+        for step in range(max_iters):
+            # Update learning rate per step (warmup + cosine decay)
+            lr = get_lr(step)
+            for param_group in optimizer.param_groups:
+                param_group["lr"] = lr
+
+            # Evaluate and generate a sample periodically
+            if step % eval_interval == 0 or step == max_iters - 1:
+                losses = estimate_loss(model)
+                print(f"step {step:5d} | train loss {losses['train']:.4f} | "
+                      f"val loss {losses['val']:.4f} | lr {lr:.6f}")
+                if step > 0:
+                    sample = generate(model, max_new_tokens=100, temp=0.8, top_k=5)
+                    print(f"--- sample ---\n{sample[:300]}\n--- end sample ---")
+
+            # Forward pass: get batch -> model -> loss
+            x, targets, mask, t = get_batch("train")
+            logits, loss = model(x, targets, mask, t)
+
+            # Backward pass
+            loss.backward()
+
+            # Gradient clipping prevents exploding gradients
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+
+            # Optimizer step + zero gradients (set_to_none=True is faster than zeroing)
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+
+            # Progress indicator every 100 steps
+            if step % 100 == 0 and step > 0:
+                dt = time.time() - t0
+                tokens_per_sec = (step * batch_size * block_size) / dt
+                print(f"  step {step:5d} | loss {loss.item():.4f} | {tokens_per_sec:.0f} tok/s")
+
+        # Save trained weights
+        torch.save(model.state_dict(), weights_path)
+        print(f"Saved weights to {weights_path}")
+
+    else:
+        print(f"No weights found at {weights_path}")
+        print("Run with --train to train from scratch.")
+        sys.exit(1)
+
+    # --- 5. Generate text ---
+    print("\n" + "=" * 60)
+    print("Generating text...")
+    print("=" * 60)
+    prompt_text = args.prompt if args.prompt else None
+    t_gen = time.time()
+    text = generate(model, max_new_tokens=args.max_tokens, prompt=prompt_text, temp=0.8, top_k=5)
+    gen_time = time.time() - t_gen
+    print(text)
+    print(f"\nGeneration: {len(encode(text))} tokens in {gen_time:.2f}s")
