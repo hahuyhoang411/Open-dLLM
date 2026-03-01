@@ -101,6 +101,7 @@ import argparse
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+from datasets import load_dataset
 from transformers import AutoTokenizer
 
 # ============================================================================
@@ -176,6 +177,192 @@ def encode(text):
 
 def decode(ids):
     return tokenizer.decode(ids, skip_special_tokens=False)
+
+
+# ============================================================================
+# Data Pipeline: FineWeb-Edu Streaming                                  [DIFF]
+# ============================================================================
+#
+# Ported from Phase 2 with per-block timestep sampling.
+#
+# Data Flow
+# =========
+#
+#     FineWeb-Edu (streaming)
+#            |
+#            v
+#     Tokenize (Qwen 3, truncate to block_size_seq=512)                 [DIFF]
+#            |
+#            v
+#     Pad to block_size_seq with [MASK]
+#            |
+#            v
+#     Sample t ~ U[0,1] PER BLOCK (not per sequence)                   [DIFF 3]
+#     Repeat to per-token shape: (B, num_blocks) -> (B, block_size_seq)
+#     mask_prob = 1 - cos²(t · π/2)
+#            |
+#            v
+#     Apply random mask per token
+#     (x[noise] = [MASK])
+#            |
+#            v
+#     Concatenate: x_input = [x_t || x_0]                              [NEW]
+#            |
+#            v
+#     Return (x_input, targets, mask, t, attn_mask)
+#
+#
+#                     Cosine Noise Schedule
+#                     =====================
+#     alpha_t
+#     1.0 |****
+#         |    ****
+#         |        ***
+#     0.5 |           ***
+#         |              ***
+#         |                 ****
+#     0.0 |                     ****
+#         +-----|------|------|------|
+#         0    0.25   0.5   0.75   1.0    t
+#
+#     mask_prob = 1 - alpha_t = 1 - cos²(t · π/2)
+#     (probability of masking each token)
+#
+# At t=0: mask_prob=0 (fully clean). At t=1: mask_prob=1 (fully masked).
+# The cosine shape provides more training signal at intermediate noise
+# levels compared to a linear schedule (MDLM, Section 3.2).
+#
+# [DIFF 3] Per-block timesteps: each block gets an independent noise level.
+# For block_size_blk=4 and block_size_seq=512, there are 128 blocks.
+# Each block's tokens share the same t, giving a staircase noise pattern.
+# When block_size_blk == block_size_seq, this reduces to Phase 2's
+# per-sequence timestep.
+
+# Create streaming iterator for training data
+# buffer_size controls how many docs are buffered for shuffling.
+# Larger = better randomness but more memory.
+_train_iter = None
+_val_iter = None
+
+def _make_train_iter():
+    ds = load_dataset(
+        "HuggingFaceFW/fineweb-edu",
+        name="sample-10BT",
+        split="train",
+        streaming=True,
+    )
+    return iter(ds.shuffle(seed=42, buffer_size=10_000))
+
+def _make_val_iter():
+    """Uses .skip(100_000) to avoid overlap with training data."""
+    ds = load_dataset(
+        "HuggingFaceFW/fineweb-edu",
+        name="sample-10BT",
+        split="train",
+        streaming=True,
+    )
+    return iter(ds.skip(100_000))
+
+# Cached staircase mask — same for all batches, computed once on first call.
+_cached_staircase_mask = None
+
+num_blocks = block_size_seq // block_size_blk
+
+
+def get_batch(split="train"):
+    """
+    Build a training batch from streamed FineWeb-Edu documents.
+
+    Returns:
+        x_input:   (B, 2*block_size_seq) — [x_t || x_0] concatenated       [NEW]
+        targets:   (B, block_size_seq)   — original unmasked token IDs
+        mask:      (B, block_size_seq)   — True where noise-masked AND real token
+        t:         (B, block_size_seq)   — per-token timestep               [DIFF 3]
+        attn_mask: (2*block_size_seq, 2*block_size_seq) — staircase mask (cached)
+    """
+    global _train_iter, _val_iter, _cached_staircase_mask
+
+    # Build staircase mask once, then reuse
+    if _cached_staircase_mask is None:
+        _cached_staircase_mask = build_staircase_mask(
+            block_size_seq, block_size_blk
+        ).to(device)
+
+    # Pick the right iterator (lazy-init on first call)
+    if split == "train":
+        if _train_iter is None:
+            _train_iter = _make_train_iter()
+        it = _train_iter
+    else:
+        if _val_iter is None:
+            _val_iter = _make_val_iter()
+        it = _val_iter
+
+    # Pull batch_size documents, tokenize, truncate, pad
+    token_seqs = []
+    padding_masks = []  # True where token is real (not padding)
+    for _ in range(batch_size):
+        try:
+            doc = next(it)
+        except StopIteration:
+            # Reinitialize iterator (extremely unlikely with FineWeb-Edu's size)
+            if split == "train":
+                _train_iter = _make_train_iter()
+                it = _train_iter
+            else:
+                _val_iter = _make_val_iter()
+                it = _val_iter
+            doc = next(it)
+
+        ids = encode(doc["text"])
+
+        # Truncate to block_size_seq
+        ids = ids[:block_size_seq]
+        seq_len = len(ids)
+
+        # Pad shorter sequences with mask_token_id (right-padding)
+        pad_len = block_size_seq - seq_len
+        if pad_len > 0:
+            ids = ids + [mask_token_id] * pad_len
+
+        token_seqs.append(ids)
+        # True for real tokens, False for padding
+        pad_mask = [True] * seq_len + [False] * pad_len
+        padding_masks.append(pad_mask)
+
+    # Stack into tensors
+    targets = torch.tensor(token_seqs, dtype=torch.long)           # (B, L)
+    padding = torch.tensor(padding_masks, dtype=torch.bool)        # (B, L)
+
+    # --- Cosine noise schedule with per-block timesteps ---         [DIFF 3]
+    # Sample one t ~ U[0,1] per block, then repeat to per-token shape.
+    # For block_size_blk == block_size_seq, num_blocks=1 -> same as Phase 2.
+    t_blocks = torch.rand(batch_size, num_blocks)                    # (B, num_blocks)
+    t = t_blocks.repeat_interleave(block_size_blk, dim=1)           # (B, L)
+    mask_prob = 1.0 - torch.cos(t * math.pi / 2).square()           # (B, L)
+
+    # Per-token binary noise mask: each token independently masked
+    noise = torch.rand(batch_size, block_size_seq) < mask_prob       # (B, L)
+
+    # Don't noise-mask padding positions — they're already [MASK] tokens.
+    # The loss mask should only include positions that were (a) noise-masked
+    # AND (b) are real tokens (not padding).
+    mask = noise & padding                                           # (B, L)
+
+    # Build x_t: replace noise-masked positions with [MASK]
+    x_noisy = targets.clone()
+    x_noisy[mask] = mask_token_id
+
+    # [NEW] Concatenate: x_input = [x_t || x_0]
+    x_input = torch.cat([x_noisy, targets], dim=1)                   # (B, 2L)
+
+    # Move everything to device
+    x_input = x_input.to(device)
+    targets = targets.to(device)
+    mask = mask.to(device)
+    t = t.to(device)
+
+    return x_input, targets, mask, t, _cached_staircase_mask
 
 
 # ============================================================================
@@ -585,3 +772,14 @@ if __name__ == "__main__" and not args.train and args.prompt is None:
     print(f"\nMask shape: {test_mask.shape}")
     print(f"Allowed entries: {(test_mask == 0.0).sum().item()}")
     print(f"Blocked entries: {(test_mask == float('-inf')).sum().item()}")
+
+    # --- Batch Shape Verification ---
+    print(f"\n=== Batch Shape Verification ===")
+    print(f"block_size_seq={block_size_seq}, block_size_blk={_saved_blk}, "
+          f"num_blocks={block_size_seq // _saved_blk}, batch_size={batch_size}")
+    L = block_size_seq
+    print(f"  x_input:   (B, 2*L)  = ({batch_size}, {2 * L})")
+    print(f"  targets:   (B, L)    = ({batch_size}, {L})")
+    print(f"  mask:      (B, L)    = ({batch_size}, {L})")
+    print(f"  t:         (B, L)    = ({batch_size}, {L})")
+    print(f"  attn_mask: (2L, 2L)  = ({2 * L}, {2 * L})")
