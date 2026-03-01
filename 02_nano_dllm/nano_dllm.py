@@ -327,3 +327,275 @@ def get_batch(split="train"):
     t = t.to(device)
 
     return x, targets, mask, t
+
+
+# ============================================================================
+# RMSNorm (Functional)
+# ============================================================================
+# No learnable parameters — purely functional normalization.
+# This is simpler than LayerNorm and works just as well for transformers.
+
+def norm(x):
+    """RMSNorm without learnable parameters."""
+    return F.rms_norm(x, (x.size(-1),))
+
+
+# ============================================================================
+# Rotary Positional Embeddings (RoPE)
+# ============================================================================
+# RoPE encodes position by rotating pairs of dimensions in the query/key
+# vectors. Unlike learned position embeddings, RoPE naturally handles
+# relative positions and generalizes to unseen sequence lengths.
+
+def apply_rotary_emb(x, cos, sin):
+    """Apply rotary embeddings to queries or keys."""
+    assert x.ndim == 4  # (B, T, H, D) from multihead attention
+    d = x.shape[3] // 2
+    x1, x2 = x[..., :d], x[..., d:]
+    y1 = x1 * cos + x2 * sin
+    y2 = x1 * (-sin) + x2 * cos
+    return torch.cat([y1, y2], 3).to(x.dtype)
+
+
+# ============================================================================
+# Multi-Head Attention
+# ============================================================================
+#
+# [DIFF 2] Bidirectional attention (is_causal=False)
+#
+# Causal vs Bidirectional Attention Masks
+# ========================================
+#
+#   Causal (GPT):              Bidirectional (dLLM):
+#   +--------+                 +--------+
+#   |X . . . |                 |X X X X |
+#   |X X . . |                 |X X X X |
+#   |X X X . |                 |X X X X |
+#   |X X X X |                 |X X X X |
+#   +--------+                 +--------+
+#     "See past only"            "See everything"
+#
+# Why bidirectional? A dLLM must see ALL tokens (including other mask tokens)
+# to figure out what goes in each masked position. If token 5 is masked, the
+# model needs context from BOTH sides to predict it — unlike GPT which only
+# needs the left context.
+
+class MultiHeadAttention(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.c_q = nn.Linear(n_embd, n_embd, bias=False)
+        self.c_k = nn.Linear(n_embd, n_embd, bias=False)
+        self.c_v = nn.Linear(n_embd, n_embd, bias=False)
+        self.c_proj = nn.Linear(n_embd, n_embd, bias=False)
+
+    def forward(self, x, cos_sin):
+        B, T, C = x.size()
+
+        # Project to queries, keys, values then reshape for multi-head
+        q = self.c_q(x).view(B, T, n_head, head_dim)
+        k = self.c_k(x).view(B, T, n_head, head_dim)
+        v = self.c_v(x).view(B, T, n_head, head_dim)
+
+        # Apply RoPE for relative positional encoding
+        cos, sin = cos_sin
+        q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
+
+        # QK-norm: stabilizes training at scale
+        q, k = norm(q), norm(k)
+
+        # Transpose to (B, H, T, D) for attention computation
+        q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+
+        # [DIFF 2]: Bidirectional attention — every token sees every other token
+        # GPT would use is_causal=True here
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=False)
+
+        # Reassemble heads and project
+        y = y.transpose(1, 2).contiguous().view(B, T, -1)
+        y = self.c_proj(y)
+        return y
+
+
+# ============================================================================
+# SwiGLU (Gated Feed-Forward Network)                                 [NEW 3]
+# ============================================================================
+#
+# Phase 1 (ReLU²):                    Phase 2 (SwiGLU):
+#   x ──→ Linear(d, 4d) ──→ ReLU²     x ──→ w1: Linear(d, h) ──→ SiLU ──┐
+#        ──→ Linear(4d, d) ──→ out          w2: Linear(d, h) ──────────→ * ──→ w3: Linear(h, d) ──→ out
+#                                       where h = round_up(8/3 * d, 256)
+#
+# SwiGLU uses a gating mechanism: one projection (w1) passes through SiLU
+# activation, then element-wise multiplies with another projection (w2).
+# This gated structure gives the model more expressiveness per parameter
+# than a plain ReLU/GELU MLP. Used in LLaMA, Gemma, and most modern LLMs.
+#
+# The hidden_dim is rounded up to a multiple of 256 for GPU memory alignment.
+
+class SwiGLU(nn.Module):
+    def __init__(self):
+        super().__init__()
+        hidden_dim = ((int(8 / 3 * n_embd) + 255) // 256) * 256
+        self.w1 = nn.Linear(n_embd, hidden_dim, bias=False)  # gate
+        self.w2 = nn.Linear(n_embd, hidden_dim, bias=False)  # up
+        self.w3 = nn.Linear(hidden_dim, n_embd, bias=False)  # down
+
+    def forward(self, x):
+        return self.w3(F.silu(self.w1(x)) * self.w2(x))
+
+
+# ============================================================================
+# Transformer Block
+# ============================================================================
+# Pre-norm architecture: normalize BEFORE attention and MLP, not after.
+# Residual connections around both sub-layers.
+
+class Block(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.attn = MultiHeadAttention()
+        self.mlp = SwiGLU()  # [NEW 3] SwiGLU replaces ReLU² MLP
+
+    def forward(self, x, cos_sin):
+        x = x + self.attn(norm(x), cos_sin)  # Attention with pre-norm
+        x = x + self.mlp(norm(x))            # SwiGLU with pre-norm
+        return x
+
+
+# ============================================================================
+# Model
+# ============================================================================
+#
+# The full diffusion language model. Architecturally, this is a standard
+# transformer (like GPT) with two key differences:
+#   1. Bidirectional attention [DIFF 2]
+#   2. Loss computed only on masked positions [DIFF 4]
+#
+# Phase 2 additionally upgrades the loss to ELBO-weighted [NEW 3]:
+#   L = mean_i( (1/t_i) * CE_masked_i )
+#
+# This comes from the continuous-time ELBO in MDLM (NeurIPS 2024):
+#   L = integral_0^1 (1/t) * E[CE on masked positions] dt
+#
+# ELBO Loss Weighting
+# ===================
+#
+#   Sample 1: t=0.1 (10% masked, hard) → weight = 1/0.1 = 10.0
+#   Sample 2: t=0.5 (50% masked, medium) → weight = 1/0.5 = 2.0
+#   Sample 3: t=0.9 (90% masked, easy) → weight = 1/0.9 = 1.1
+#
+#   Low t = fewer masks = harder predictions = MORE weight
+#   High t = many masks = easier predictions = LESS weight
+
+class Model(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+        # Token embeddings: each of the 32768 BPE tokens gets an n_embd-dim vector
+        self.token_emb = nn.Embedding(vocab_size, n_embd)
+
+        # Precompute rotary embeddings for up to 2x block_size positions
+        self.rotary_seq_len = block_size * 2
+        cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len)
+        self.register_buffer("cos", cos, persistent=False)
+        self.register_buffer("sin", sin, persistent=False)
+
+        # Stack of transformer blocks
+        self.blocks = nn.ModuleList([Block() for _ in range(n_layer)])
+
+        # Output projection: predict which of the vocab_size tokens belongs at each position
+        self.lm_head = nn.Linear(n_embd, vocab_size, bias=False)
+
+        # Initialize weights
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        """Normal(0, 0.02) initialization for Linear and Embedding layers."""
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
+    def _precompute_rotary_embeddings(self, seq_len, base=10000, device=None):
+        """Precompute cos/sin tables for RoPE."""
+        if device is None:
+            device = self.token_emb.weight.device
+        channel_range = torch.arange(0, head_dim, 2, dtype=torch.float32, device=device)
+        inv_freq = 1.0 / (base ** (channel_range / head_dim))
+        t = torch.arange(seq_len, dtype=torch.float32, device=device)
+        freqs = torch.outer(t, inv_freq)
+        cos, sin = freqs.cos(), freqs.sin()
+        # Add batch and head dims: (1, T, 1, D//2)
+        cos, sin = cos[None, :, None, :], sin[None, :, None, :]
+        return cos, sin
+
+    def forward(self, idx, targets=None, mask=None, t=None):
+        """
+        Forward pass.
+
+        Args:
+            idx: input token IDs, shape (B, T)
+            targets: ground-truth token IDs, shape (B, T). None during generation.
+            mask: boolean mask, shape (B, T). True where tokens were masked.
+            t: timestep per sequence, shape (B,). Used for ELBO weighting.
+
+        Returns:
+            logits: (B, T, vocab_size)
+            loss: scalar or None
+        """
+        B, T = idx.size()
+
+        # Embed tokens and normalize
+        x = self.token_emb(idx)  # (B, T, n_embd)
+        x = norm(x)
+
+        # Slice rotary embeddings to current sequence length
+        assert T <= self.cos.size(1)
+        cos_sin = (self.cos[:, :T], self.sin[:, :T])
+
+        # Forward through transformer blocks
+        for block in self.blocks:
+            x = block(x, cos_sin)
+        x = norm(x)
+
+        # Project to vocabulary logits
+        logits = self.lm_head(x)  # (B, T, vocab_size)
+
+        if targets is None:
+            loss = None
+        else:
+            # [DIFF 4]: Loss on masked positions only
+            # [NEW 3]: ELBO weighting by 1/t
+            #
+            # Phase 1: loss = CE_masked.sum() / mask.sum()  (unweighted)
+            # Phase 2: loss = mean_i( (1/t_i) * CE_masked_i )  (ELBO weighted)
+            #
+            # Why 1/t? The continuous-time ELBO from MDLM (NeurIPS 2024):
+            #   L = integral_0^1 (1/t) * E[CE on masked positions] dt
+            # Low t means less masking → harder predictions → higher weight.
+
+            per_token_loss = F.cross_entropy(
+                logits.view(-1, vocab_size), targets.view(-1), reduction="none"
+            )
+            per_token_loss = per_token_loss.view(B, T)
+
+            if mask is not None and t is not None:
+                # Per-sample masked loss
+                masked_loss = (per_token_loss * mask.float()).sum(dim=1)  # (B,)
+                mask_count = mask.float().sum(dim=1).clamp(min=1)         # (B,)
+                per_sample_loss = masked_loss / mask_count                # (B,)
+
+                # ELBO weight: 1/t, clamped for stability
+                elbo_weight = 1.0 / t.clamp(min=1e-4)  # (B,)
+
+                loss = (per_sample_loss * elbo_weight).mean()
+            elif mask is not None:
+                # Fallback: masked loss without ELBO weighting
+                mask_flat = mask.view(-1).float()
+                loss = (per_token_loss.view(-1) * mask_flat).sum() / mask_flat.sum()
+            else:
+                loss = per_token_loss.mean()
+
+        return logits, loss
