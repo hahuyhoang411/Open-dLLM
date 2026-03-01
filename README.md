@@ -32,7 +32,7 @@ The model sees ALL positions at once (bidirectional attention) and fills in the 
 | Phase | Status | What You'll Build | What You'll Learn | Prerequisites |
 |-------|--------|-------------------|-------------------|---------------|
 | `01_hello_diffusion` | Done | ~10M param char-level dLLM on Tiny Shakespeare | Masked diffusion basics, bidirectional attention, confidence-based decoding | Python, PyTorch basics |
-| `02_nano_dllm` | Coming soon | BPE model on FineWeb-Edu | Cosine noise schedule, ELBO weighting, BPE tokenization, scaling | Phase 1 |
+| `02_nano_dllm` | Done | BPE model on FineWeb-Edu | Cosine noise schedule, ELBO weighting, BPE tokenization, scaling | Phase 1 |
 | `03_block_diffusion` | Coming soon | Block diffusion model (Mercury-style) | Block-causal attention, KV caching, T2T editing, variable-length generation | Phase 2 |
 | `04_advanced` | Coming soon | Advanced techniques | Flow matching, diffu-GRPO (RL), TiDAR (hybrid AR+diffusion), SEDD | Phase 2 |
 
@@ -56,6 +56,13 @@ cd 01_hello_diffusion && python hello_diffusion.py --train
 
 # Generate text (loads saved weights)
 python hello_diffusion.py
+
+# Phase 2: BPE diffusion model on FineWeb-Edu
+pip install datasets tokenizers   # or: pip install -e ".[phase2]"
+cd ../02_nano_dllm
+python train_tokenizer.py          # Train BPE tokenizer (~30s)
+python nano_dllm.py --train --depth 6   # ~1 hour on T4 GPU
+python nano_dllm.py --depth 6 --prompt "The meaning of life is"
 ```
 
 ---
@@ -88,7 +95,11 @@ Open-dLLM/
 │   ├── hello_diffusion.py              # Complete dLLM in ~640 lines of annotated Python
 │   ├── download_data.py                # Downloads Tiny Shakespeare
 │   └── data.txt                        # Tiny Shakespeare (gitignored)
-├── 02_nano_dllm/                       # Coming soon
+├── 02_nano_dllm/
+│   ├── README.md                       # Theory: cosine schedule, ELBO, BPE, SwiGLU
+│   ├── nano_dllm.py                    # BPE diffusion LLM in ~930 lines
+│   ├── train_tokenizer.py              # BPE tokenizer training on FineWeb-Edu
+│   └── tokenizer.json                  # Trained 32K BPE tokenizer
 ├── 03_block_diffusion/                 # Coming soon
 ├── 04_advanced/                        # Coming soon
 └── docs/
