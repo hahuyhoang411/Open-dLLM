@@ -67,6 +67,28 @@ python nano_dllm.py --depth 6 --prompt "The meaning of life is"
 
 ---
 
+## Evaluation
+
+Run the DCLM CORE benchmark (22 tasks, centered accuracy) to compare dLLM vs autoregressive models:
+
+```bash
+# Install eval dependencies
+pip install -e ".[eval]"
+
+# Evaluate our dLLM (needs trained weights)
+python eval/base_eval.py --model dllm --depth 6
+
+# Compare with GPT-2
+python eval/base_eval.py --hf-model gpt2
+
+# Quick eval (limited examples per task)
+python eval/base_eval.py --model dllm --depth 6 --max-per-task 100
+```
+
+DCLM CORE score is centered accuracy averaged over 22 tasks (0 = random guessing, 1 = perfect). GPT-2 (124M) scores ~0.257. See [`eval/`](eval/) for details.
+
+---
+
 ## The 5 Changes from GPT to dLLM
 
 A diffusion LLM is a GPT with exactly 5 surgical modifications. Everything else (transformer, RMSNorm, RoPE, MLP) stays the same.
@@ -100,6 +122,9 @@ Open-dLLM/
 │   ├── nano_dllm.py                    # BPE diffusion LLM in ~930 lines
 │   ├── train_tokenizer.py              # BPE tokenizer training on FineWeb-Edu
 │   └── tokenizer.json                  # Trained 32K BPE tokenizer
+├── eval/
+│   ├── core_eval.py                    # DCLM CORE evaluation engine (22 tasks)
+│   └── base_eval.py                    # CLI: --model dllm or --hf-model gpt2
 ├── 03_block_diffusion/                 # Coming soon
 ├── 04_advanced/                        # Coming soon
 └── docs/
