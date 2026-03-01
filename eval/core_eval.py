@@ -452,7 +452,7 @@ def evaluate_example(idx, model_fn, tokenize_fn, data, device, task_meta,
                 crop = seq_len - max_seq_len
                 tokens[j] = tokens[j][crop:]
                 start_idxs[j] = max(start_idxs[j] - crop, 0)
-                end_idxs[j] = end_idxs[j] - crop
+                end_idxs[j] = max(end_idxs[j] - crop, start_idxs[j] + 1)
 
     # --- Stack and move to device ---
     pad_token_id = mask_token_id if mask_token_id is not None else 0
@@ -521,6 +521,8 @@ def evaluate_task(model_fn, tokenize_fn, data, device, task_meta,
 
     Returns: float, accuracy in [0, 1]
     """
+    if not data:
+        return 0.0
     correct = 0
     for idx in range(len(data)):
         if evaluate_example(

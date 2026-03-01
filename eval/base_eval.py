@@ -265,6 +265,12 @@ def run_core(model_fn, tokenize_fn, device, mode, mask_token_id,
             "elapsed_seconds": elapsed,
         }
 
+        # Free GPU memory between tasks to prevent OOM on MPS
+        if device == "mps":
+            torch.mps.empty_cache()
+        elif device == "cuda":
+            torch.cuda.empty_cache()
+
         print(f"  {task_name:40s} | acc={acc:.4f} | centered={centered:.4f} "
               f"| n={len(data):4d} | {elapsed:.1f}s")
 
