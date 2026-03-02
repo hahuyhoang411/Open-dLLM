@@ -965,6 +965,9 @@ def generate(model, max_new_tokens=512, prompt=None, denoise_steps=10,
     print(f"Generation stats: {total_steps} denoise steps, {tokens_generated} tokens, "
           f"{tok_per_sec:.1f} tok/s")
 
+    # Reset KV cache so stale generation state doesn't leak into training
+    model.reset_kv_cache()
+
     if was_training:
         model.train()
     return decode(all_tokens)
