@@ -33,7 +33,7 @@ The model sees ALL positions at once (bidirectional attention) and fills in the 
 |-------|--------|-------------------|-------------------|---------------|
 | `01_hello_diffusion` | Done | ~10M param char-level dLLM on Tiny Shakespeare | Masked diffusion basics, bidirectional attention, confidence-based decoding | Python, PyTorch basics |
 | `02_nano_dllm` | Done | BPE model on FineWeb-Edu | Cosine noise schedule, ELBO weighting, BPE tokenization, scaling | Phase 1 |
-| `03_block_diffusion` | Coming soon | Block diffusion model (Mercury-style) | Block-causal attention, KV caching, T2T editing, variable-length generation | Phase 2 |
+| `03_block_diffusion` | Done | Block diffusion model (BD3-LM style) | Staircase attention mask, KV caching, block-by-block generation, Qwen 3 tokenizer | Phase 2 |
 | `04_advanced` | Coming soon | Advanced techniques | Flow matching, diffu-GRPO (RL), TiDAR (hybrid AR+diffusion), SEDD | Phase 2 |
 
 ---
@@ -63,6 +63,12 @@ cd ../02_nano_dllm
 python train_tokenizer.py          # Train BPE tokenizer (~30s)
 python nano_dllm.py --train --depth 6   # ~1 hour on T4 GPU
 python nano_dllm.py --depth 6 --prompt "The meaning of life is"
+
+# Phase 3: Block diffusion on FineWeb-Edu
+pip install -e ".[phase3]"    # datasets, transformers
+cd ../03_block_diffusion
+python block_dllm.py --train --depth 10 --block-size 4   # ~2 hours on P100
+python block_dllm.py --depth 10 --block-size 4 --prompt "The meaning of life is"
 ```
 
 ---
@@ -125,7 +131,8 @@ Open-dLLM/
 ├── eval/
 │   ├── core_eval.py                    # DCLM CORE evaluation engine (22 tasks)
 │   └── base_eval.py                    # CLI: --model dllm or --hf-model gpt2
-├── 03_block_diffusion/                 # Coming soon
+├── 03_block_diffusion/
+│   └── block_dllm.py                 # Block diffusion with staircase mask (~1180 lines)
 ├── 04_advanced/                        # Coming soon
 └── docs/
     ├── plans/                          # Design documents
