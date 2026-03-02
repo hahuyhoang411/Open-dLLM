@@ -33,8 +33,8 @@ The model sees ALL positions at once (bidirectional attention) and fills in the 
 |-------|--------|-------------------|-------------------|---------------|
 | `01_hello_diffusion` | Done | ~10M param char-level dLLM on Tiny Shakespeare | Masked diffusion basics, bidirectional attention, confidence-based decoding | Python, PyTorch basics |
 | `02_nano_dllm` | Done | BPE model on FineWeb-Edu | Cosine noise schedule, ELBO weighting, BPE tokenization, scaling | Phase 1 |
-| `03_block_diffusion` | Done | Block diffusion model (BD3-LM style) | Staircase attention mask, KV caching, block-by-block generation, Qwen 3 tokenizer | Phase 2 |
-| `04_advanced` | Coming soon | Advanced techniques | Flow matching, diffu-GRPO (RL), TiDAR (hybrid AR+diffusion), SEDD | Phase 2 |
+| `03_block_diffusion` | Done | Block diffusion model (BD3-LM style) | Staircase attention mask, KV caching, block-by-block generation, per-block timesteps | Phase 2 |
+| `04_advanced` | Coming soon | Advanced techniques | Qwen 3 tokenizer, flow matching, diffu-GRPO (RL), TiDAR (hybrid AR+diffusion), SEDD | Phase 3 |
 
 ---
 
@@ -65,10 +65,10 @@ python nano_dllm.py --train --depth 6   # ~1 hour on T4 GPU
 python nano_dllm.py --depth 6 --prompt "The meaning of life is"
 
 # Phase 3: Block diffusion on FineWeb-Edu
-pip install -e ".[phase3]"    # datasets, transformers
+pip install -e ".[phase3]"    # datasets, tokenizers
 cd ../03_block_diffusion
-python block_dllm.py --train --depth 10 --block-size 4   # ~2 hours on P100
-python block_dllm.py --depth 10 --block-size 4 --prompt "The meaning of life is"
+python block_dllm.py --train --depth 6 --block-size 4    # ~2 hours on P100
+python block_dllm.py --depth 6 --block-size 4 --prompt "The meaning of life is"
 ```
 
 ---

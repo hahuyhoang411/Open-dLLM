@@ -12,8 +12,8 @@ Usage examples:
     # Evaluate a dLLM model with explicit weights path
     python eval/base_eval.py --model dllm --depth 6 --weights path/to/weights.pt
 
-    # Evaluate a block diffusion model (depth=10, block_size=4)
-    python eval/base_eval.py --model block_dllm --depth 10 --block-size 4
+    # Evaluate a block diffusion model (depth=6, block_size=4)
+    python eval/base_eval.py --model block_dllm --depth 6 --block-size 4
 
     # Evaluate a HuggingFace AR model (e.g., GPT-2)
     python eval/base_eval.py --hf-model gpt2
@@ -359,7 +359,7 @@ def main():
         epilog="""\
 examples:
   python eval/base_eval.py --model dllm --depth 6
-  python eval/base_eval.py --model block_dllm --depth 10 --block-size 4
+  python eval/base_eval.py --model block_dllm --depth 6 --block-size 4
   python eval/base_eval.py --hf-model gpt2
   python eval/base_eval.py --hf-model gpt2 --max-per-task 50
 """,

@@ -2,8 +2,8 @@
 block_dllm.py — A block diffusion language model trained on FineWeb-Edu.
 
 Phase 3 of Open-dLLM: upgrades from full-sequence diffusion (Phase 2) to
-block diffusion with a staircase attention mask and KV caching. Uses Qwen 3
-tokenizer (~152K vocab) and tied embeddings for a ~200M param budget.
+block diffusion with a staircase attention mask and KV caching. Same BPE
+tokenizer (vocab=32768) and depth parametrization as Phase 2.
 
 The key change from Phase 2: replace is_causal=False (fully bidirectional)
 with an explicit staircase attention mask — bidirectional within each block,
@@ -17,9 +17,9 @@ Architecture Overview
            |
            v
     +-------------------+
-    | Token Embedding    |               vocab_size=151670 (Qwen 3 + [MASK])  [DIFF]
-    | (151670 -> D)      |               D = depth * 64
-    +-------------------+                depth=10 -> D=640
+    | Token Embedding    |               vocab_size=32768 (BPE)
+    | (32768 -> D)       |               D = depth * 64
+    +-------------------+                depth=6 -> D=384
            |
            v
     +-------------------+
@@ -49,12 +49,12 @@ Architecture Overview
            |
            v
     +-------------------+
-    | LM Head (tied)     |               Shares weights with embedding     [NEW]
+    | LM Head            |               Linear(D -> vocab)
     | (D -> vocab)       |
     +-------------------+
            |
            v
-    Output: logits (B, T, 151670)        Predict original token at EVERY position
+    Output: logits (B, T, 32768)         Predict original token at EVERY position
 
     Block Diffusion                                                         [NEW]
     ===============
@@ -70,20 +70,18 @@ Architecture Overview
 
     Depth parametrization (same as Phase 2)
     =======================================
-    depth=6  -> 384-dim,  6 heads,  6 layers
+    depth=6  -> 384-dim,  6 heads,  6 layers  (~26M params)
     depth=10 -> 640-dim, 10 heads, 10 layers
     depth=12 -> 768-dim, 12 heads, 12 layers
 
     [DIFF] markers (changes from Phase 2):
-      [DIFF 1] Qwen 3 tokenizer (vocab_size=151670, replaces custom BPE)
-      [DIFF 2] Staircase attention mask (replaces is_causal=False)
-      [DIFF 3] Per-block noise levels (replaces per-sequence)
-      [DIFF 4] Tied embeddings (LM head shares embedding weights)
+      [DIFF 1] Staircase attention mask (replaces is_causal=False)
+      [DIFF 2] Per-block noise levels (replaces per-sequence)
 
     [NEW] markers for Phase 3:
       [NEW 1] Block diffusion with configurable block size
       [NEW 2] KV caching across blocks for inference
-      [NEW 3] Block-by-block generation with EOS termination
+      [NEW 3] Block-by-block generation
 
 References:
     - BD3-LMs (Arriola et al., ICLR 2025 Oral): arxiv.org/abs/2503.09573
@@ -102,7 +100,7 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 from datasets import load_dataset
-from transformers import AutoTokenizer
+from tokenizers import Tokenizer
 
 # ============================================================================
 # CLI Arguments
@@ -111,7 +109,7 @@ from transformers import AutoTokenizer
 def parse_args():
     parser = argparse.ArgumentParser(description="block_dllm — block diffusion language model")
     parser.add_argument("--train", action="store_true", help="train from scratch")
-    parser.add_argument("--depth", type=int, default=10, help="model depth (controls all dims)")
+    parser.add_argument("--depth", type=int, default=6, help="model depth (controls all dims)")
     parser.add_argument("--prompt", type=str, default=None, help="text prompt for generation")
     parser.add_argument("--max-tokens", type=int, default=512, help="max tokens to generate")
     parser.add_argument("--block-size", type=int, default=4, choices=[0, 1, 2, 4, 8, 16],
@@ -129,7 +127,7 @@ args = parse_args()
 
 depth = args.depth
 n_layer = depth
-n_embd = depth * 64     # depth=10 -> 640
+n_embd = depth * 64     # depth=6 -> 384, depth=12 -> 768
 n_head = depth
 head_dim = 64            # fixed across all depths
 
@@ -163,22 +161,22 @@ device = (
 torch.manual_seed(1337)
 
 # ============================================================================
-# Tokenizer: Qwen 3 with [MASK]
+# Tokenizer: BPE with [MASK] at id=0
 # ============================================================================
-# Phase 2 used a custom BPE tokenizer (vocab=32768). Phase 3 upgrades to
-# Qwen 3 (~152K vocab) with tied embeddings to stay within param budget. [DIFF 1]
+# Same BPE tokenizer as Phase 2 (vocab=32768). [MASK] is special_tokens[0]
+# with id=0, same convention as Phase 1.
 
-tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B")
-tokenizer.add_special_tokens({"additional_special_tokens": ["[MASK]"]})
-vocab_size = len(tokenizer)  # 151670 (151669 + 1 for [MASK])
-mask_token_id = tokenizer.convert_tokens_to_ids("[MASK]")
-eos_token_id = tokenizer.eos_token_id
+tokenizer_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tokenizer.json")
+tokenizer = Tokenizer.from_file(tokenizer_path)
+vocab_size = tokenizer.get_vocab_size()   # 32768
+mask_token_id = tokenizer.token_to_id("[MASK]")  # 0
+eos_token_id = None  # BPE tokenizer has no EOS; future: Qwen 3 for Phase 4
 
 def encode(text):
-    return tokenizer.encode(text, add_special_tokens=False)
+    return tokenizer.encode(text).ids
 
 def decode(ids):
-    return tokenizer.decode(ids, skip_special_tokens=False)
+    return tokenizer.decode(ids)
 
 
 # ============================================================================
@@ -193,13 +191,13 @@ def decode(ids):
 #     FineWeb-Edu (streaming)
 #            |
 #            v
-#     Tokenize (Qwen 3, truncate to block_size_seq=512)                 [DIFF]
+#     Tokenize (BPE, truncate to block_size_seq=512)
 #            |
 #            v
 #     Pad to block_size_seq with [MASK]
 #            |
 #            v
-#     Sample t ~ U[0,1] PER BLOCK (not per sequence)                   [DIFF 3]
+#     Sample t ~ U[0,1] PER BLOCK (not per sequence)                   [DIFF 2]
 #     Repeat to per-token shape: (B, num_blocks) -> (B, block_size_seq)
 #     mask_prob = 1 - cos²(t · π/2)
 #            |
@@ -234,7 +232,7 @@ def decode(ids):
 # The cosine shape provides more training signal at intermediate noise
 # levels compared to a linear schedule (MDLM, Section 3.2).
 #
-# [DIFF 3] Per-block timesteps: each block gets an independent noise level.
+# [DIFF 2] Per-block timesteps: each block gets an independent noise level.
 # For block_size_blk=4 and block_size_seq=512, there are 128 blocks.
 # Each block's tokens share the same t, giving a staircase noise pattern.
 # When block_size_blk == block_size_seq, this reduces to Phase 2's
@@ -279,7 +277,7 @@ def get_batch(split="train"):
         x_input:   (B, 2*block_size_seq) — [x_t || x_0] concatenated       [NEW]
         targets:   (B, block_size_seq)   — original unmasked token IDs
         mask:      (B, block_size_seq)   — True where noise-masked AND real token
-        t:         (B, block_size_seq)   — per-token timestep               [DIFF 3]
+        t:         (B, block_size_seq)   — per-token timestep               [DIFF 2]
         attn_mask: (2*block_size_seq, 2*block_size_seq) — staircase mask (cached)
     """
     global _train_iter, _val_iter, _cached_staircase_mask
@@ -336,7 +334,7 @@ def get_batch(split="train"):
     targets = torch.tensor(token_seqs, dtype=torch.long)           # (B, L)
     padding = torch.tensor(padding_masks, dtype=torch.bool)        # (B, L)
 
-    # --- Cosine noise schedule with per-block timesteps ---         [DIFF 3]
+    # --- Cosine noise schedule with per-block timesteps ---         [DIFF 2]
     # Sample one t ~ U[0,1] per block, then repeat to per-token shape.
     # For block_size_blk == block_size_seq, num_blocks=1 -> same as Phase 2.
     t_blocks = torch.rand(batch_size, num_blocks)                    # (B, num_blocks)
@@ -629,10 +627,8 @@ class Block(nn.Module):
 # ============================================================================
 #
 # Changes from Phase 2:
-#   [DIFF 1] vocab_size = 151670 (Qwen 3 + [MASK]), up from 32768
-#   [DIFF 4] Tied embeddings: lm_head.weight = token_emb.weight
-#   [DIFF 2] Explicit attn_mask threaded through all blocks
-#   [DIFF 3] Per-token ELBO weighting (t is B,L not B,)
+#   [DIFF 1] Explicit attn_mask threaded through all blocks
+#   [DIFF 2] Per-token ELBO weighting (t is B,L not B,)
 #
 # RoPE precomputed for block_size_seq * 2 = 1024 positions to handle
 # [x_t || x_0] concatenation during training.
@@ -642,7 +638,7 @@ class Block(nn.Module):
 #   Logits extracted from first half only: [:, :L]
 #   Loss computed on masked positions in x_t with per-token ELBO weight 1/t
 #
-# ELBO Loss with Per-Token Timesteps                                    [DIFF 3]
+# ELBO Loss with Per-Token Timesteps                                    [DIFF 2]
 # ==========================================
 #   Phase 2: t is (B,) — one timestep per sequence
 #   Phase 3: t is (B, L) — one timestep per token (each block has own noise)
@@ -654,7 +650,7 @@ class Model(nn.Module):
     def __init__(self):
         super().__init__()
 
-        # Token embeddings: Qwen 3 vocab + [MASK]                       [DIFF 1]
+        # Token embeddings: BPE vocab (32768)
         self.token_emb = nn.Embedding(vocab_size, n_embd)
 
         # Precompute rotary embeddings: 2x context length for training
@@ -667,14 +663,10 @@ class Model(nn.Module):
         # Stack of transformer blocks
         self.blocks = nn.ModuleList([Block() for _ in range(n_layer)])
 
-        # Output projection — tied with embedding                       [DIFF 4]
+        # Output projection
         self.lm_head = nn.Linear(n_embd, vocab_size, bias=False)
 
-        # Initialize weights BEFORE tying, so the shared tensor is only
-        # initialized once (via token_emb). If we tie first, apply() would
-        # reinitialize the same tensor twice with different random draws.
         self.apply(self._init_weights)
-        self.lm_head.weight = self.token_emb.weight
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -757,7 +749,7 @@ class Model(nn.Module):
         if targets is None:
             loss = None
         else:
-            # [DIFF 3] Per-token ELBO weighting: t is (B, L) not (B,)
+            # [DIFF 2] Per-token ELBO weighting: t is (B, L) not (B,)
             # Weight: 1/t per token, applied to per-token CE loss on masked positions
             per_token_loss = F.cross_entropy(
                 logits.view(-1, vocab_size), targets.view(-1), reduction="none"
@@ -950,11 +942,12 @@ def generate(model, max_new_tokens=512, prompt=None, denoise_steps=10,
         new_tokens = block[0, fill_from_prompt:].tolist()
 
         # Check for EOS — truncate at first occurrence
-        for i, tok in enumerate(new_tokens):
-            if tok == eos_token_id:
-                new_tokens = new_tokens[:i]
-                done = True
-                break
+        if eos_token_id is not None:
+            for i, tok in enumerate(new_tokens):
+                if tok == eos_token_id:
+                    new_tokens = new_tokens[:i]
+                    done = True
+                    break
 
         all_tokens.extend(new_tokens)
         tokens_generated += len(new_tokens)
@@ -1036,7 +1029,7 @@ def get_lr(step):
 #        v
 #   model(x_input, targets, mask, t, attn_mask) -> loss
 #        |              [DIFF] masked positions with staircase mask
-#        v              [DIFF 3] ELBO weighted by per-token 1/t
+#        v              [DIFF 2] ELBO weighted by per-token 1/t
 #   loss.backward()
 #        |
 #        v
@@ -1083,10 +1076,7 @@ if __name__ == "__main__":
     # --- 3. Instantiate model ---
     model = Model().to(device)
     param_count = sum(p.numel() for p in model.parameters())
-    # Tied embeddings: lm_head shares token_emb weights, so subtract one copy
-    tied_params = model.token_emb.weight.numel()
-    print(f"{param_count / 1e6:.2f}M parameters ({(param_count - tied_params) / 1e6:.2f}M unique, "
-          f"{tied_params / 1e6:.2f}M tied)")
+    print(f"{param_count / 1e6:.2f}M parameters")
 
     # --- 4. Load or train ---
     if os.path.exists(weights_path) and not args.train:

@@ -15,7 +15,7 @@ phase2 = [
 ]
 phase3 = [
     "datasets>=2.0.0",
-    "transformers>=4.30.0",
+    "tokenizers>=0.15.0",
 ]
 eval = [
     "jinja2>=3.0.0",

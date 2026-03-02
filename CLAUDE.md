@@ -19,7 +19,7 @@
 - Weights live at `02_nano_dllm/weights/nano_dllm_d{depth}.pt`
 - MPS (Apple Silicon) fragments memory over many forward passes — call `torch.mps.empty_cache()` between tasks
 - `03_block_diffusion/block_dllm.py` has module-level `parse_args()` — same gotcha as Phase 2
-- Qwen 3 tokenizer downloaded on first run (~500MB, cached by transformers)
+- Phase 3 reuses Phase 2's BPE tokenizer (tokenizer.json copied to each dir)
 - Weights at `03_block_diffusion/weights/block_dllm_d{depth}_b{block_size}.pt`
 
 ## Kaggle
@@ -30,5 +30,5 @@
 ## Dependencies
 - Core: `torch`
 - Phase 2: `pip install -e ".[phase2]"` (datasets, tokenizers)
-- Phase 3: `pip install -e ".[phase3]"` (datasets, transformers)
+- Phase 3: `pip install -e ".[phase3]"` (datasets, tokenizers)
 - Eval: `pip install -e ".[eval]"` (jinja2, pyyaml, transformers)
