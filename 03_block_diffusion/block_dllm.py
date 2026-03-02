@@ -507,7 +507,8 @@ class MultiHeadAttention(nn.Module):
         self.c_k = nn.Linear(n_embd, n_embd, bias=False)
         self.c_v = nn.Linear(n_embd, n_embd, bias=False)
         self.c_proj = nn.Linear(n_embd, n_embd, bias=False)
-        self.kv_cache = None  # [NEW 2] (cached_k, cached_v) or None
+        self.kv_cache = None   # [NEW 2] (cached_k, cached_v) or None
+        self.cache_mode = False # [NEW 2] when True, auto-append K,V to cache
 
     def reset_cache(self):
         self.kv_cache = None
@@ -555,6 +556,10 @@ class MultiHeadAttention(nn.Module):
         # Transpose to (B, H, T, D) for attention computation
         q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
 
+        # [NEW 2] Save current block's K,V BEFORE prepending cache
+        # (we only want to cache the current block, not the full sequence)
+        k_current, v_current = k, v
+
         # [NEW 2] Prepend cached K,V from finalized blocks during generation
         if self.kv_cache is not None:
             cached_k, cached_v = self.kv_cache
@@ -568,6 +573,10 @@ class MultiHeadAttention(nn.Module):
             y = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
         else:
             y = F.scaled_dot_product_attention(q, k, v, is_causal=False)
+
+        # [NEW 2] Auto-cache current block's K,V after attention
+        if self.cache_mode:
+            self.update_cache(k_current, v_current)
 
         # Reassemble heads and project
         y = y.transpose(1, 2).contiguous().view(B, T, -1)
@@ -685,7 +694,13 @@ class Model(nn.Module):
         for block in self.blocks:
             block.attn.reset_cache()
 
-    def forward(self, idx, targets=None, mask=None, t=None, attn_mask=None):
+    def set_cache_mode(self, enabled):
+        """Toggle auto-caching of K,V in all attention layers."""
+        for block in self.blocks:
+            block.attn.cache_mode = enabled
+
+    def forward(self, idx, targets=None, mask=None, t=None, attn_mask=None,
+                pos_offset=0):
         """
         Forward pass.
 
@@ -696,6 +711,9 @@ class Model(nn.Module):
             t: timestep per token, shape (B, L). Used for per-token ELBO weighting.
             attn_mask: float attention mask (B*n_head or 1, T, T) or None.
                        -inf = don't attend, 0.0 = attend.
+            pos_offset: RoPE position offset for KV-cached generation.       [NEW 2]
+                        Block at position i gets RoPE positions
+                        [pos_offset, pos_offset + block_size_blk).
 
         Returns:
             logits: (B, L, vocab_size) during training, (B, T, vocab_size) during inference
@@ -710,11 +728,13 @@ class Model(nn.Module):
         # Slice rotary embeddings to current sequence length
         # During training: T = 2L, but cos/sin sliced to L (shared-position RoPE)
         # During inference: T = block_size_blk, cos/sin sliced to T
+        #                   with pos_offset for block position             [NEW 2]
         if targets is not None:
             L = targets.size(1)
             cos_sin = (self.cos[:, :L], self.sin[:, :L])
         else:
-            cos_sin = (self.cos[:, :T], self.sin[:, :T])
+            cos_sin = (self.cos[:, pos_offset:pos_offset + T],
+                       self.sin[:, pos_offset:pos_offset + T])
 
         # Forward through transformer blocks, threading attn_mask
         for block in self.blocks:
@@ -753,6 +773,195 @@ class Model(nn.Module):
                 loss = per_token_loss.mean()
 
         return logits, loss
+
+
+# ============================================================================
+# Generation: Block-by-Block with KV Cache                              [NEW 3]
+# ============================================================================
+#
+# Unlike Phase 2 (full-sequence diffusion), Phase 3 generates one block at a
+# time with KV caching — combining AR's sequential block generation with
+# diffusion's parallel in-block decoding.
+#
+# Block-by-Block Generation with KV Cache
+# ========================================
+#
+#   Prompt: "The quick brown fox"   block_size_blk=4   denoise_steps=10
+#
+#   Step 0: Warm up KV cache with prompt blocks
+#   +-----------+
+#   | The quick |  -> forward pass, cache K0,V0
+#   +-----------+
+#   | brown fox |  -> forward pass (attends to K0,V0), cache K1,V1
+#   +-----------+
+#
+#   Step 1: Generate block 2 (first new block)
+#   KV cache: [K0,V0 | K1,V1]
+#   Block input: [_ _ _ _]  (all [MASK])
+#
+#     Denoise iteration 1:
+#       Input: [_ _ _ _]   pos_offset=8
+#       Q from block 2, K/V = [K0|K1|K_current], [V0|V1|V_current]
+#       Confidence:  0.45  0.98  0.72  0.91
+#       Decode?:      no   YES    no    no
+#       Result: [_ jumped _ _]
+#
+#     Denoise iteration 2:
+#       Input: [_ jumped _ _]
+#       Confidence:  0.97  --   0.88  0.96
+#       Decode?:     YES   --    no   YES
+#       Result: [▁ jumped ▁over _]
+#
+#     Denoise iteration 3:
+#       Input: [▁ jumped ▁over _]
+#       Confidence:  --    --   --   0.99
+#       Result: [▁ jumped ▁over ▁the]  <- block fully denoised!
+#
+#     Final pass: cache K2,V2 from denoised block
+#
+#   Step 2: Generate block 3
+#   KV cache: [K0,V0 | K1,V1 | K2,V2]
+#   Block input: [_ _ _ _]
+#   ...continue until max_new_tokens or EOS...
+#
+# Key differences from Phase 2:
+#   1. Input is ONE BLOCK (block_size_blk tokens), not full sequence
+#   2. Attention uses KV cache: Q_current @ [K_cached | K_current]
+#   3. RoPE offset: block i gets positions [i*block_size_blk, (i+1)*block_size_blk)
+#   4. denoise_steps caps iterations per block (Phase 2 runs until all unmasked)
+#   5. After each block: one final forward pass with cache_mode=True to save K,V
+
+@torch.no_grad()
+def generate(model, max_new_tokens=512, prompt=None, denoise_steps=10,
+             temp=0.8, top_k=5, confidence_threshold=0.95):
+    was_training = model.training
+    model.eval()
+
+    # Encode prompt
+    prompt_ids = encode(prompt) if prompt else []
+    prompt_len = len(prompt_ids)
+
+    # Reset KV cache for fresh generation
+    model.reset_kv_cache()
+    model.set_cache_mode(False)
+
+    all_tokens = list(prompt_ids)
+    total_steps = 0
+    t_start = time.time()
+
+    # --- Warm up KV cache with full prompt blocks ---
+    # Split prompt into full blocks, cache each one
+    n_full_prompt_blocks = prompt_len // block_size_blk
+    prompt_remainder = prompt_len % block_size_blk
+    pos_offset = 0
+
+    model.set_cache_mode(True)
+    for i in range(n_full_prompt_blocks):
+        start = i * block_size_blk
+        end = start + block_size_blk
+        block_ids = torch.tensor(
+            [prompt_ids[start:end]], dtype=torch.long, device=device
+        )
+        model(block_ids, pos_offset=pos_offset)
+        pos_offset += block_size_blk
+    model.set_cache_mode(False)
+
+    # --- Block-by-block generation loop ---
+    tokens_generated = 0
+    done = False
+
+    while tokens_generated < max_new_tokens and not done:
+        # How many positions in this block come from the prompt remainder?
+        fill_from_prompt = min(prompt_remainder, block_size_blk)
+        gen_positions = block_size_blk - fill_from_prompt
+
+        # Initialize block: prompt remainder (if any) + [MASK] tokens
+        block = torch.full(
+            (1, block_size_blk), mask_token_id, dtype=torch.long, device=device
+        )
+        if fill_from_prompt > 0:
+            remainder_start = n_full_prompt_blocks * block_size_blk
+            block[0, :fill_from_prompt] = torch.tensor(
+                prompt_ids[remainder_start:remainder_start + fill_from_prompt],
+                dtype=torch.long, device=device,
+            )
+
+        # Track which positions need decoding (only the [MASK] ones)
+        masked = torch.zeros(1, block_size_blk, dtype=torch.bool, device=device)
+        masked[0, fill_from_prompt:] = True
+
+        # --- Denoise loop: iteratively unmask within this block ---
+        for step in range(denoise_steps):
+            if not masked.any():
+                break
+            total_steps += 1
+
+            # Forward pass: just the current block, KV cache handles context
+            logits, _ = model(block, pos_offset=pos_offset)
+            probs = F.softmax(logits / temp, dim=-1)
+
+            # Never generate [MASK] tokens
+            probs[:, :, mask_token_id] = 0.0
+
+            # Top-k confidence-based unmasking
+            top_k_probs, top_k_indices = torch.topk(probs, k=top_k, dim=-1)
+            confidences = top_k_probs.sum(dim=-1)  # (1, block_size_blk)
+
+            # Unmask positions above confidence threshold
+            decode_mask = (confidences >= confidence_threshold) & masked
+
+            # If nothing qualifies, force-unmask the most confident masked position
+            if not decode_mask.any():
+                masked_confidences = torch.where(
+                    masked, confidences,
+                    torch.tensor(-float("inf"), device=device),
+                )
+                decode_mask.view(-1)[masked_confidences.argmax()] = True
+
+            # Sample from normalized top-k distribution
+            top_k_probs_norm = top_k_probs / top_k_probs.sum(dim=-1, keepdim=True)
+            sampled_k = torch.multinomial(
+                top_k_probs_norm.view(-1, top_k), 1
+            ).view(1, block_size_blk)
+            sampled_tokens = torch.gather(
+                top_k_indices, -1, sampled_k.unsqueeze(-1)
+            ).squeeze(-1)
+
+            # Place sampled tokens at decoded positions
+            block = torch.where(decode_mask, sampled_tokens, block)
+            masked = masked & ~decode_mask
+
+        # --- Cache the finalized block ---
+        model.set_cache_mode(True)
+        model(block, pos_offset=pos_offset)
+        model.set_cache_mode(False)
+        pos_offset += block_size_blk
+
+        # Consume prompt remainder (only affects first generated block)
+        prompt_remainder = 0
+
+        # Extract generated tokens from this block (skip prompt remainder)
+        new_tokens = block[0, fill_from_prompt:].tolist()
+
+        # Check for EOS — truncate at first occurrence
+        for i, tok in enumerate(new_tokens):
+            if tok == eos_token_id:
+                new_tokens = new_tokens[:i]
+                done = True
+                break
+
+        all_tokens.extend(new_tokens)
+        tokens_generated += len(new_tokens)
+
+    # --- Stats ---
+    elapsed = time.time() - t_start
+    tok_per_sec = tokens_generated / elapsed if elapsed > 0 else float("inf")
+    print(f"Generation stats: {total_steps} denoise steps, {tokens_generated} tokens, "
+          f"{tok_per_sec:.1f} tok/s")
+
+    if was_training:
+        model.train()
+    return decode(all_tokens)
 
 
 # ============================================================================
@@ -905,7 +1114,9 @@ if __name__ == "__main__":
                 losses = estimate_loss(model)
                 print(f"step {step:5d} | train loss {losses['train']:.4f} | "
                       f"val loss {losses['val']:.4f} | lr {lr:.6f}")
-                # sample generation will be added with Task 7
+                if step > 0:
+                    sample = generate(model, max_new_tokens=64, temp=0.8, top_k=5)
+                    print(f"--- sample ---\n{sample[:300]}\n--- end sample ---")
                 if device == "mps":
                     torch.mps.empty_cache()
 
@@ -941,10 +1152,9 @@ if __name__ == "__main__":
 
     # --- 5. Generate text ---
     if args.prompt is not None:
-        # sample generation will be added with Task 7
-        print("\n" + "=" * 60)
-        print("Generation (--prompt) will be added with Task 7.")
-        print("=" * 60)
+        sample = generate(model, max_new_tokens=args.max_tokens, prompt=args.prompt,
+                          denoise_steps=args.denoise_steps, temp=0.8, top_k=5)
+        print(sample)
 
     elif not args.train:
         # --- Debug: Mask verification and batch shape printing ---
