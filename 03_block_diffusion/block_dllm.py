@@ -136,6 +136,8 @@ head_dim = 64            # fixed across all depths
 # Block size                                                                 [NEW 1]
 block_size_seq = 512     # context length in tokens (same as Phase 2)
 block_size_blk = block_size_seq if args.block_size == 0 else args.block_size
+assert block_size_seq % block_size_blk == 0, \
+    f"block_size_seq={block_size_seq} must be divisible by block_size_blk={block_size_blk}"
 
 # Training hyperparameters
 batch_size = 32
@@ -419,8 +421,10 @@ def build_staircase_mask(seq_len, block_size_blk):
     # M_BD: same block, same half — full bidirectional within a block
     m_bd = (block_q == block_kv) & (x0_flag_q == x0_flag_kv)
 
-    # M_OBC: x_t queries attend to x_0 keys from current or earlier blocks
-    m_obc = (block_q >= block_kv) & x0_flag_kv & ~x0_flag_q
+    # M_OBC: x_t queries attend to x_0 keys from STRICTLY EARLIER blocks only
+    # Using > (not >=) to prevent x_t from peeking at its own block's clean x_0,
+    # which would leak the training labels to masked positions.
+    m_obc = (block_q > block_kv) & x0_flag_kv & ~x0_flag_q
 
     # M_BC: x_0 queries attend to x_0 keys from current or earlier blocks
     m_bc = (block_q >= block_kv) & x0_flag_kv & x0_flag_q
@@ -653,9 +657,9 @@ class Model(nn.Module):
         # Token embeddings: Qwen 3 vocab + [MASK]                       [DIFF 1]
         self.token_emb = nn.Embedding(vocab_size, n_embd)
 
-        # Precompute rotary embeddings for 2x context length
-        # (handles [x_t || x_0] during training)
-        self.rotary_seq_len = block_size_seq * 2
+        # Precompute rotary embeddings: 2x context length for training
+        # ([x_t || x_0]), or 4096 for long generation with KV cache
+        self.rotary_seq_len = max(block_size_seq * 2, 4096)
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len)
         self.register_buffer("cos", cos, persistent=False)
         self.register_buffer("sin", sin, persistent=False)
@@ -665,10 +669,12 @@ class Model(nn.Module):
 
         # Output projection — tied with embedding                       [DIFF 4]
         self.lm_head = nn.Linear(n_embd, vocab_size, bias=False)
-        self.lm_head.weight = self.token_emb.weight
 
-        # Initialize weights (tied weight initialized once via token_emb)
+        # Initialize weights BEFORE tying, so the shared tensor is only
+        # initialized once (via token_emb). If we tie first, apply() would
+        # reinitialize the same tensor twice with different random draws.
         self.apply(self._init_weights)
+        self.lm_head.weight = self.token_emb.weight
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
