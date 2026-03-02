@@ -100,7 +100,7 @@ def load_dllm_model(depth, weights_path, device):
     Adds 02_nano_dllm/ to sys.path, overrides the module-level config globals
     for the given depth, instantiates the model, and loads weights.
 
-    Returns: (model_fn, tokenize_fn, mask_token_id, block_size)
+    Returns: (model_fn, tokenize_fn, mask_token_id, pad_token_id, block_size)
     """
     # The script lives at eval/base_eval.py; repo root is one level up
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -144,7 +144,7 @@ def load_dllm_model(depth, weights_path, device):
     def tokenize_fn(text):
         return ndllm.encode(text)
 
-    return model_fn, tokenize_fn, ndllm.mask_token_id, ndllm.block_size
+    return model_fn, tokenize_fn, ndllm.mask_token_id, ndllm.pad_token_id, ndllm.block_size
 
 
 # =============================================================================
@@ -157,7 +157,7 @@ def load_block_dllm_model(depth, block_size, weights_path, device):
     Same pattern as load_dllm_model: patches sys.argv before importing
     block_dllm (which has module-level parse_args()), loads weights.
 
-    Returns: (model_fn, tokenize_fn, mask_token_id, max_seq_len)
+    Returns: (model_fn, tokenize_fn, mask_token_id, pad_token_id, max_seq_len)
     """
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     block_dllm_dir = os.path.join(repo_root, "03_block_diffusion")
@@ -194,7 +194,7 @@ def load_block_dllm_model(depth, block_size, weights_path, device):
     def tokenize_fn(text):
         return bdllm.encode(text)
 
-    return model_fn, tokenize_fn, bdllm.mask_token_id, bdllm.block_size_seq
+    return model_fn, tokenize_fn, bdllm.mask_token_id, bdllm.pad_token_id, bdllm.block_size_seq
 
 
 # =============================================================================
@@ -204,8 +204,8 @@ def load_block_dllm_model(depth, block_size, weights_path, device):
 def load_hf_model(hf_path, device):
     """Load a HuggingFace autoregressive model for scoring.
 
-    Returns: (model_fn, tokenize_fn, None, max_seq_len)
-        mask_token_id is None (AR models don't use masking).
+    Returns: (model_fn, tokenize_fn, None, None, max_seq_len)
+        mask_token_id and pad_token_id are None (AR models don't use masking).
     """
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -225,7 +225,7 @@ def load_hf_model(hf_path, device):
         return tokenizer.encode(text)
 
     max_seq_len = 1024 if "gpt2" in hf_path else None
-    return model_fn, tokenize_fn, None, max_seq_len
+    return model_fn, tokenize_fn, None, None, max_seq_len
 
 
 # =============================================================================
@@ -233,7 +233,7 @@ def load_hf_model(hf_path, device):
 # =============================================================================
 
 def run_core(model_fn, tokenize_fn, device, mode, mask_token_id,
-             mc_num, max_seq_len, max_per_task):
+             mc_num, max_seq_len, max_per_task, pad_token_id=None):
     """Run all 22 DCLM CORE tasks and compute the CORE score.
 
     Returns: dict with per-task results and overall CORE score.
@@ -299,6 +299,7 @@ def run_core(model_fn, tokenize_fn, device, mode, mask_token_id,
             model_fn, tokenize_fn, data, device, task_meta,
             mode=mode, mask_token_id=mask_token_id,
             mc_num=mc_num, max_seq_len=max_seq_len,
+            pad_token_id=pad_token_id,
         )
         elapsed = time.time() - t0
 
@@ -425,7 +426,7 @@ examples:
             weights_path = os.path.join(
                 repo_root, "02_nano_dllm", "weights", f"nano_dllm_d{args.depth}.pt"
             )
-        model_fn, tokenize_fn, mask_token_id, max_seq_len = load_dllm_model(
+        model_fn, tokenize_fn, mask_token_id, pad_token_id, max_seq_len = load_dllm_model(
             args.depth, weights_path, device
         )
         mode = "dllm"
@@ -437,12 +438,12 @@ examples:
                 repo_root, "03_block_diffusion", "weights",
                 f"block_dllm_d{args.depth}_b{args.block_size}.pt",
             )
-        model_fn, tokenize_fn, mask_token_id, max_seq_len = load_block_dllm_model(
+        model_fn, tokenize_fn, mask_token_id, pad_token_id, max_seq_len = load_block_dllm_model(
             args.depth, args.block_size, weights_path, device
         )
         mode = "dllm"
     else:
-        model_fn, tokenize_fn, mask_token_id, max_seq_len = load_hf_model(
+        model_fn, tokenize_fn, mask_token_id, pad_token_id, max_seq_len = load_hf_model(
             args.hf_model, device
         )
         mode = "ar"
@@ -451,7 +452,7 @@ examples:
     results = run_core(
         model_fn, tokenize_fn, device, mode, mask_token_id,
         mc_num=args.mc_num, max_seq_len=max_seq_len,
-        max_per_task=args.max_per_task,
+        max_per_task=args.max_per_task, pad_token_id=pad_token_id,
     )
 
     print(f"\nFinal CORE score: {results['__core_score__']:.4f}")

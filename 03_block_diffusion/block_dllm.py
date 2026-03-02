@@ -161,16 +161,19 @@ device = (
 torch.manual_seed(1337)
 
 # ============================================================================
-# Tokenizer: BPE with [MASK] at id=0
+# Tokenizer: BPE with special tokens [MASK]=0, <|endoftext|>=1, <|padding|>=2
 # ============================================================================
-# Same BPE tokenizer as Phase 2 (vocab=32768). [MASK] is special_tokens[0]
-# with id=0, same convention as Phase 1.
+# Same BPE tokenizer as Phase 2 (vocab=32768). Special token IDs are stable:
+#   [MASK]=0       — diffusion noise token
+#   <|endoftext|>=1 — document boundary / EOS (enables generation stopping)
+#   <|padding|>=2   — right-padding for short sequences
 
 tokenizer_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tokenizer.json")
 tokenizer = Tokenizer.from_file(tokenizer_path)
 vocab_size = tokenizer.get_vocab_size()   # 32768
-mask_token_id = tokenizer.token_to_id("[MASK]")  # 0
-eos_token_id = None  # BPE tokenizer has no EOS; future: Qwen 3 for Phase 4
+mask_token_id = tokenizer.token_to_id("[MASK]")       # 0
+eos_token_id = tokenizer.token_to_id("<|endoftext|>")  # 1
+pad_token_id = tokenizer.token_to_id("<|padding|>")    # 2
 
 def encode(text):
     return tokenizer.encode(text).ids
@@ -191,10 +194,10 @@ def decode(ids):
 #     FineWeb-Edu (streaming)
 #            |
 #            v
-#     Tokenize (BPE, truncate to block_size_seq=512)
+#     Tokenize (BPE) + append <|endoftext|>, truncate to block_size_seq=512
 #            |
 #            v
-#     Pad to block_size_seq with [MASK]
+#     Pad to block_size_seq with <|padding|>
 #            |
 #            v
 #     Sample t ~ U[0,1] PER BLOCK (not per sequence)                   [DIFF 2]
@@ -316,14 +319,17 @@ def get_batch(split="train"):
 
         ids = encode(doc["text"])
 
-        # Truncate to block_size_seq
+        # Append EOS to mark document boundary
+        ids = ids + [eos_token_id]
+
+        # Truncate to block_size_seq (EOS may be clipped for long docs — that's fine)
         ids = ids[:block_size_seq]
         seq_len = len(ids)
 
-        # Pad shorter sequences with mask_token_id (right-padding)
+        # Pad shorter sequences with pad_token_id (right-padding)
         pad_len = block_size_seq - seq_len
         if pad_len > 0:
-            ids = ids + [mask_token_id] * pad_len
+            ids = ids + [pad_token_id] * pad_len
 
         token_seqs.append(ids)
         # True for real tokens, False for padding
@@ -344,7 +350,7 @@ def get_batch(split="train"):
     # Per-token binary noise mask: each token independently masked
     noise = torch.rand(batch_size, block_size_seq) < mask_prob       # (B, L)
 
-    # Don't noise-mask padding positions — they're already [MASK] tokens.
+    # Don't noise-mask padding positions — they're <|padding|> tokens.
     # The loss mask should only include positions that were (a) noise-masked
     # AND (b) are real tokens (not padding).
     mask = noise & padding                                           # (B, L)
@@ -898,8 +904,9 @@ def generate(model, max_new_tokens=512, prompt=None, denoise_steps=10,
             logits, _ = model(block, pos_offset=pos_offset)
             probs = F.softmax(logits / temp, dim=-1)
 
-            # Never generate [MASK] tokens
+            # Never generate [MASK] or <|padding|> tokens
             probs[:, :, mask_token_id] = 0.0
+            probs[:, :, pad_token_id] = 0.0
 
             # Top-k confidence-based unmasking
             top_k_probs, top_k_indices = torch.topk(probs, k=top_k, dim=-1)

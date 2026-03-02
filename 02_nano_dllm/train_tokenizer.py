@@ -34,7 +34,7 @@ def train_tokenizer(text_path: str) -> Tokenizer:
 
     trainer = trainers.BpeTrainer(
         vocab_size=VOCAB_SIZE,
-        special_tokens=["[MASK]"],
+        special_tokens=["[MASK]", "<|endoftext|>", "<|padding|>"],
     )
     tokenizer.train([text_path], trainer)
     return tokenizer
@@ -64,9 +64,12 @@ def main() -> None:
     tokenizer.save(TOKENIZER_PATH)
     print(f"Saved tokenizer to {TOKENIZER_PATH}")
 
-    # Verify
+    # Verify special token IDs
     print(f"Vocab size: {tokenizer.get_vocab_size():,}")
     assert tokenizer.token_to_id("[MASK]") == 0, "[MASK] should have id=0"
+    assert tokenizer.token_to_id("<|endoftext|>") == 1, "<|endoftext|> should have id=1"
+    assert tokenizer.token_to_id("<|padding|>") == 2, "<|padding|> should have id=2"
+    print("Special tokens: [MASK]=0, <|endoftext|>=1, <|padding|>=2")
 
     test = "Hello, world! This is a test of the BPE tokenizer."
     encoded = tokenizer.encode(test)

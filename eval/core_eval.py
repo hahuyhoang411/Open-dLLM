@@ -398,7 +398,8 @@ def forward_model_dllm(model_fn, input_ids, start_idxs, end_idxs,
 # =============================================================================
 
 def evaluate_example(idx, model_fn, tokenize_fn, data, device, task_meta,
-                     mode="ar", mask_token_id=None, mc_num=64, max_seq_len=None):
+                     mode="ar", mask_token_id=None, mc_num=64, max_seq_len=None,
+                     pad_token_id=None):
     """Evaluate a single DCLM CORE example and return whether prediction is correct.
 
     Handles the full pipeline: fewshot sampling -> prompt rendering -> tokenization
@@ -455,7 +456,8 @@ def evaluate_example(idx, model_fn, tokenize_fn, data, device, task_meta,
                 end_idxs[j] = max(end_idxs[j] - crop, start_idxs[j] + 1)
 
     # --- Stack and move to device ---
-    pad_token_id = mask_token_id if mask_token_id is not None else 0
+    if pad_token_id is None:
+        pad_token_id = mask_token_id if mask_token_id is not None else 0
     input_ids = stack_sequences(tokens, pad_token_id).to(device)
 
     # --- Forward pass ---
@@ -505,7 +507,8 @@ def evaluate_example(idx, model_fn, tokenize_fn, data, device, task_meta,
 
 
 def evaluate_task(model_fn, tokenize_fn, data, device, task_meta,
-                  mode="ar", mask_token_id=None, mc_num=64, max_seq_len=None):
+                  mode="ar", mask_token_id=None, mc_num=64, max_seq_len=None,
+                  pad_token_id=None):
     """Evaluate all examples in a DCLM CORE task and return mean accuracy.
 
     Args:
@@ -518,6 +521,7 @@ def evaluate_task(model_fn, tokenize_fn, data, device, task_meta,
         mask_token_id: int, required when mode='dllm'
         mc_num: int, MC samples for dllm mode
         max_seq_len: int or None, truncate from the left if sequences exceed this
+        pad_token_id: int or None, explicit padding token (falls back to mask_token_id)
 
     Returns: float, accuracy in [0, 1]
     """
@@ -527,7 +531,7 @@ def evaluate_task(model_fn, tokenize_fn, data, device, task_meta,
     for idx in range(len(data)):
         if evaluate_example(
             idx, model_fn, tokenize_fn, data, device, task_meta,
-            mode, mask_token_id, mc_num, max_seq_len
+            mode, mask_token_id, mc_num, max_seq_len, pad_token_id
         ):
             correct += 1
     return correct / len(data)
