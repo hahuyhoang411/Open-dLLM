@@ -12,6 +12,9 @@ Usage examples:
     # Evaluate a dLLM model with explicit weights path
     python eval/base_eval.py --model dllm --depth 6 --weights path/to/weights.pt
 
+    # Evaluate a block diffusion model (depth=10, block_size=4)
+    python eval/base_eval.py --model block_dllm --depth 10 --block-size 4
+
     # Evaluate a HuggingFace AR model (e.g., GPT-2)
     python eval/base_eval.py --hf-model gpt2
 
@@ -142,6 +145,56 @@ def load_dllm_model(depth, weights_path, device):
         return ndllm.encode(text)
 
     return model_fn, tokenize_fn, ndllm.mask_token_id, ndllm.block_size
+
+
+# =============================================================================
+# Model Loading — Block dLLM (block_dllm)
+# =============================================================================
+
+def load_block_dllm_model(depth, block_size, weights_path, device):
+    """Load the Phase 3 block diffusion model for scoring.
+
+    Same pattern as load_dllm_model: patches sys.argv before importing
+    block_dllm (which has module-level parse_args()), loads weights.
+
+    Returns: (model_fn, tokenize_fn, mask_token_id, max_seq_len)
+    """
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    block_dllm_dir = os.path.join(repo_root, "03_block_diffusion")
+
+    # Patch sys.argv before importing block_dllm so its parse_args() works
+    saved_argv = sys.argv
+    sys.argv = ["block_dllm.py", f"--depth={depth}", f"--block-size={block_size}"]
+
+    if block_dllm_dir not in sys.path:
+        sys.path.insert(0, block_dllm_dir)
+
+    import importlib
+    if "block_dllm" in sys.modules:
+        importlib.reload(sys.modules["block_dllm"])
+    import block_dllm as bdllm
+
+    sys.argv = saved_argv
+
+    # Instantiate model and load weights
+    model = bdllm.Model().to(device)
+    print(f"Loading block_dllm weights from {weights_path}")
+    state_dict = torch.load(weights_path, map_location=device, weights_only=True)
+    model.load_state_dict(state_dict)
+    model.requires_grad_(False)
+
+    param_count = sum(p.numel() for p in model.parameters())
+    print(f"block_dllm model loaded: depth={depth}, block_size={block_size}, "
+          f"params={param_count:,}, device={device}")
+
+    def model_fn(input_ids):
+        logits, _ = model(input_ids)
+        return logits
+
+    def tokenize_fn(text):
+        return bdllm.encode(text)
+
+    return model_fn, tokenize_fn, bdllm.mask_token_id, bdllm.block_size_seq
 
 
 # =============================================================================
@@ -306,14 +359,15 @@ def main():
         epilog="""\
 examples:
   python eval/base_eval.py --model dllm --depth 6
+  python eval/base_eval.py --model block_dllm --depth 10 --block-size 4
   python eval/base_eval.py --hf-model gpt2
   python eval/base_eval.py --hf-model gpt2 --max-per-task 50
 """,
     )
 
     parser.add_argument(
-        "--model", choices=["dllm"],
-        help="Model type to score (currently: dllm)",
+        "--model", choices=["dllm", "block_dllm"],
+        help="Model type to score (dllm or block_dllm)",
     )
     parser.add_argument(
         "--depth", type=int, default=6,
@@ -322,6 +376,10 @@ examples:
     parser.add_argument(
         "--weights", type=str, default=None,
         help="Path to dLLM weights file (default: auto from depth)",
+    )
+    parser.add_argument(
+        "--block-size", type=int, default=4,
+        help="Block size for block_dllm model (default: 4)",
     )
     parser.add_argument(
         "--hf-model", type=str, default=None,
@@ -369,6 +427,18 @@ examples:
             )
         model_fn, tokenize_fn, mask_token_id, max_seq_len = load_dllm_model(
             args.depth, weights_path, device
+        )
+        mode = "dllm"
+    elif args.model == "block_dllm":
+        weights_path = args.weights
+        if weights_path is None:
+            repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            weights_path = os.path.join(
+                repo_root, "03_block_diffusion", "weights",
+                f"block_dllm_d{args.depth}_b{args.block_size}.pt",
+            )
+        model_fn, tokenize_fn, mask_token_id, max_seq_len = load_block_dllm_model(
+            args.depth, args.block_size, weights_path, device
         )
         mode = "dllm"
     else:
