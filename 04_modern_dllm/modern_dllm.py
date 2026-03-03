@@ -985,7 +985,8 @@ class Model(nn.Module):
             # the full (B*L, vocab_size) logit tensor. This saves ~1GB for
             # vocab=32768 at batch=32, seq=512.
             if use_liger:
-                per_token_loss = LigerFusedLinearCrossEntropyFunction.apply(
+                # Returns (loss, z_loss, token_accuracy, predicted_tokens)
+                per_token_loss, _, _, _ = LigerFusedLinearCrossEntropyFunction.apply(
                     x_pred.contiguous().view(-1, n_embd),  # _input (B*L, D)
                     self.lm_head.weight,                    # weight (vocab, D)
                     targets.contiguous().view(-1),          # target (B*L,)
