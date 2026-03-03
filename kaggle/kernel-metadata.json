@@ -1,7 +1,7 @@
 {
-  "id": "hhoang41/open-dllm-phase2-training",
-  "title": "open-dllm-phase2-training",
-  "code_file": "train_phase2.ipynb",
+  "id": "hhoang41/open-dllm-phase4-training",
+  "title": "open-dllm-phase4-training",
+  "code_file": "train_phase4.ipynb",
   "language": "python",
   "kernel_type": "notebook",
   "is_private": true,
