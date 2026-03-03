@@ -24,6 +24,7 @@ Phase 4 changes from Phase 3 [P4]:
     [P4-16] Qwen3-0.6B architecture (16L/1024d/16h/4kv/2816MLP, tied embeddings, MLP dropout)
     [P4-17] WSD scheduler (warmup-stable-decay, replaces cosine)
     [P4-18] Multi-source 100B dataset (FinePDFs+DCLM+FineWeb-Edu)
+    [P4-19] Fix training loss: real-token normalization, CART off by default
 
 Requires: PyTorch 2.5+ (FlexAttention, GQA enable_gqa), CUDA (Triton kernels)
 
@@ -124,8 +125,8 @@ def parse_args():
                         help="disable Liger fused kernels (use PyTorch fallbacks)")
     parser.add_argument("--no-flex", action="store_true",                           # [P4-6]
                         help="disable FlexAttention (use float staircase mask)")
-    parser.add_argument("--no-cart", action="store_true",                           # [P4-8]
-                        help="disable CART noise rescheduling (use uniform 1/t)")
+    parser.add_argument("--cart", action="store_true",                               # [P4-8]
+                        help="enable CART noise rescheduling (default: off, use uniform 1/t)")
     parser.add_argument("--cart-p", type=float, default=0.1,                        # [P4-8]
                         help="CART geometric distribution parameter (default: 0.1)")
     parser.add_argument("--no-compile", action="store_true",                        # [P4-13]
@@ -214,7 +215,7 @@ t_max = 0.95
 use_amp = not args.no_amp and torch.cuda.is_available()                    # [P4-1]
 use_liger = not args.no_liger and LIGER_AVAILABLE                          # [P4-3]
 use_flex = not args.no_flex and FLEX_AVAILABLE and torch.cuda.is_available()  # [P4-6]
-use_cart = not args.no_cart                                                # [P4-8]
+use_cart = args.cart                                                       # [P4-8]
 cart_p = args.cart_p
 use_compile = not args.no_compile and torch.cuda.is_available()            # [P4-13]
 use_muon = not args.no_muon and MUON_AVAILABLE                             # [P4-11]
@@ -362,7 +363,9 @@ def _compute_cart_weights(mask, padding, p=0.1):
     cart_scores = F.conv1d(ctx, kernel).squeeze(1)  # (B, L)
 
     # Inverse: less context -> higher weight (concentrate signal on hard tokens)
-    return 1.0 / cart_scores.clamp(min=1e-4)
+    # Cap max weight to 1/t_min (=20), matching the uniform 1/t range.
+    # Ref: Dream 7B (arXiv:2412.06264). Disabled by default; enable with --cart.
+    return (1.0 / cart_scores.clamp(min=1e-4)).clamp(max=1.0 / t_min)
 
 
 # Cached staircase mask — same for all batches, computed once on first call.
@@ -461,6 +464,15 @@ def get_batch(split="train"):
     # Don't noise-mask padding positions — they're <|padding|> tokens.
     mask = noise & padding                                           # (B, L)
 
+    # Guarantee at least 1 masked token per sequence (Ref: JinjieNi/MegaDLMs)
+    zero_masked = mask.sum(dim=1) == 0
+    if zero_masked.any():
+        for seq_idx in zero_masked.nonzero(as_tuple=True)[0]:
+            real_pos = padding[seq_idx].nonzero(as_tuple=True)[0]
+            if len(real_pos) > 0:
+                pick = real_pos[torch.randint(len(real_pos), (1,))]
+                mask[seq_idx, pick] = True
+
     # Build x_t: replace noise-masked positions with <|mask|>
     x_noisy = targets.clone()
     x_noisy[mask] = mask_token_id
@@ -471,6 +483,16 @@ def get_batch(split="train"):
     # (Fast-dLLM v2, arXiv:2509.26328)
     comp_noise = ~noise                                              # complement
     comp_mask = comp_noise & padding
+
+    # Same min-1-masked guarantee for complement
+    zero_masked_comp = comp_mask.sum(dim=1) == 0
+    if zero_masked_comp.any():
+        for seq_idx in zero_masked_comp.nonzero(as_tuple=True)[0]:
+            real_pos = padding[seq_idx].nonzero(as_tuple=True)[0]
+            if len(real_pos) > 0:
+                pick = real_pos[torch.randint(len(real_pos), (1,))]
+                comp_mask[seq_idx, pick] = True
+
     x_noisy_comp = targets.clone()
     x_noisy_comp[comp_mask] = mask_token_id
     # Complementary sample uses 1-t (symmetric noise level)
@@ -1011,12 +1033,18 @@ class Model(nn.Module):
                 # either uniform 1/t or CART context-adaptive weights.
                 elbo_weight = t  # (B, L) — pre-computed
 
+                # [P4-19] Normalize by ALL real tokens, not just masked ones.
+                # The 1/t importance weight already accounts for the masked fraction,
+                # so dividing by N_masked double-counts (inflates loss ~3.3x).
+                # Ref: ZHZisZZ/dllm (maskable_mask.sum()), JinjieNi/MegaDLMs (loss_mask.sum())
                 weighted_loss = per_token_loss * mask.float() * elbo_weight  # (B, L)
-                mask_count = mask.float().sum().clamp(min=1)
-                loss = weighted_loss.sum() / mask_count
+                real_count = (targets != pad_token_id).float().sum().clamp(min=1)
+                loss = weighted_loss.sum() / real_count
             elif mask is not None:
+                # [P4-19] Same real-token normalization for non-ELBO path
                 mask_flat = mask.view(-1).float()
-                loss = (per_token_loss.view(-1) * mask_flat).sum() / mask_flat.sum()
+                real_count = (targets != pad_token_id).float().sum().clamp(min=1)
+                loss = (per_token_loss.view(-1) * mask_flat).sum() / real_count
             else:
                 loss = per_token_loss.mean()
 

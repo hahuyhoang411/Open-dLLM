@@ -29,16 +29,19 @@
 - Phase 4 tokenizer must be retrained after `train_tokenizer.py` changes (old tokenizer.json incompatible)
 - Phase 4 dataset: `HuggingFaceFW/finepdfs_50BT-dclm_30BT-fineweb_edu_20BT-shuffled` (100B tokens)
 - Weights at `04_modern_dllm/weights/modern_dllm_b{block_size}.pt`
+- Phase 4 CART weighting is OFF by default (enable with `--cart`). Loss normalization divides by all real tokens (not just masked) — [P4-19]
+- Phase 4 expected step-0 loss: ~10-11 (ln(32768)). If higher, check loss normalization and ELBO weighting
 
 ## Kaggle
 - Push notebooks: `uv run kaggle kernels push -p kaggle/`
 - kernel-metadata.json `title` must exactly match `id` slug
 - Needs `KAGGLE_API_TOKEN` env var for auth
+- GPU selection: `"machine_shape": "NvidiaTeslaT4"` for 2xT4, default `"enable_gpu": true` gives P100
 
 ## Dependencies
 - Core: `torch`
 - Phase 2: `pip install -e ".[phase2]"` (datasets, tokenizers)
 - Phase 3: `pip install -e ".[phase3]"` (datasets, tokenizers)
-- Phase 4: `pip install -e ".[phase4]"` (datasets, tokenizers, liger-kernel, muon)
+- Phase 4: `pip install -e ".[phase4]"` (datasets, tokenizers, liger-kernel, muon-optimizer from GitHub)
 - Phase 4 DDP: `torchrun --nproc_per_node=2 04_modern_dllm/modern_dllm.py --train`
 - Eval: `pip install -e ".[eval]"` (jinja2, pyyaml, transformers)
