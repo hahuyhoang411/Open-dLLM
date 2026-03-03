@@ -47,6 +47,7 @@ import sys
 import math
 import time
 import argparse
+import contextlib
 
 import torch
 import torch.nn as nn
@@ -1435,7 +1436,11 @@ if __name__ == "__main__":
             for pg in optimizer.param_groups:
                 pg["lr"] = pg["initial_lr"] * lr_factor
 
-            # Evaluate periodically (master only — avoids duplicate IO)
+            # [P4-14] DDP: all ranks must sync before/after eval to prevent deadlock.
+            # Without barrier, rank 0 enters estimate_loss while rank 1 calls backward
+            # (which triggers NCCL all_reduce) — rank 0 never joins → NCCL timeout.
+            if ddp:
+                dist.barrier()
             if master_process and (step % eval_interval == 0 or step == max_iters - 1):
                 losses = estimate_loss(raw_model)
                 print(f"step {step:5d} | train loss {losses['train']:.4f} | "
@@ -1447,15 +1452,22 @@ if __name__ == "__main__":
                     torch.mps.empty_cache()
                 elif "cuda" in str(device):
                     torch.cuda.empty_cache()                               # [P4-15]
+            if ddp:
+                dist.barrier()
 
             # [P4-12] Gradient accumulation: accumulate gradients over micro-steps,
             # scale loss by 1/grad_accum_steps so total gradient magnitude is correct.
+            # [P4-14] DDP no_sync: skip all_reduce on intermediate micro-steps. Only
+            # the last micro-step triggers NCCL all_reduce to average gradients.
             for micro_step in range(grad_accum_steps):
-                x_input, targets, mask, elbo_w, attn_mask = get_batch("train")
-                with torch.amp.autocast("cuda", enabled=use_amp):
-                    logits, loss = model(x_input, targets, mask, elbo_w, attn_mask)
-                    loss = loss / grad_accum_steps
-                scaler.scale(loss).backward()
+                no_sync = ddp and micro_step < grad_accum_steps - 1
+                ctx = model.no_sync() if no_sync else contextlib.nullcontext()
+                with ctx:
+                    x_input, targets, mask, elbo_w, attn_mask = get_batch("train")
+                    with torch.amp.autocast("cuda", enabled=use_amp):
+                        logits, loss = model(x_input, targets, mask, elbo_w, attn_mask)
+                        loss = loss / grad_accum_steps
+                    scaler.scale(loss).backward()
 
             # Gradient clipping: unscale first so clip threshold is in true gradient scale
             scaler.unscale_(optimizer)
