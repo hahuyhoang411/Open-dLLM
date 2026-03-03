@@ -15,6 +15,9 @@ Usage examples:
     # Evaluate a block diffusion model (depth=6, block_size=4)
     python eval/base_eval.py --model block_dllm --depth 6 --block-size 4
 
+    # Evaluate a modern dLLM model (Phase 4, depth=8, block_size=32)
+    python eval/base_eval.py --model modern_dllm --depth 8 --block-size 32
+
     # Evaluate a HuggingFace AR model (e.g., GPT-2)
     python eval/base_eval.py --hf-model gpt2
 
@@ -198,6 +201,68 @@ def load_block_dllm_model(depth, block_size, weights_path, device):
 
 
 # =============================================================================
+# Model Loading — Modern dLLM (modern_dllm, Phase 4)
+# =============================================================================
+
+def load_modern_dllm_model(depth, seq_len, block_size, weights_path, device):
+    """Load the Phase 4 modern block diffusion model for scoring.
+
+    Same pattern as load_block_dllm_model: patches sys.argv before importing
+    modern_dllm (which has module-level parse_args()), loads weights.
+    Disables AMP, Liger, FlexAttention, and CART for eval portability.
+
+    Returns: (model_fn, tokenize_fn, mask_token_id, pad_token_id, max_seq_len)
+    """
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    modern_dllm_dir = os.path.join(repo_root, "04_modern_dllm")
+
+    # Patch sys.argv before importing modern_dllm so its parse_args() works.
+    # Disable CUDA-only features (AMP, Liger, FlexAttention, CART) for eval
+    # portability — eval may run on MPS or CPU.
+    saved_argv = sys.argv
+    sys.argv = [
+        "modern_dllm.py",
+        f"--depth={depth}",
+        f"--seq-len={seq_len}",
+        f"--block-size={block_size}",
+        "--no-amp", "--no-liger", "--no-flex", "--no-cart",
+    ]
+
+    if modern_dllm_dir not in sys.path:
+        sys.path.insert(0, modern_dllm_dir)
+
+    import importlib
+    if "modern_dllm" in sys.modules:
+        importlib.reload(sys.modules["modern_dllm"])
+    import modern_dllm as mdllm
+
+    sys.argv = saved_argv
+
+    # Override device to match eval device (module-level auto-detects CUDA)
+    mdllm.device = device
+
+    # Instantiate model and load weights
+    model = mdllm.Model().to(device)
+    print(f"Loading modern_dllm weights from {weights_path}")
+    state_dict = torch.load(weights_path, map_location=device, weights_only=True)
+    model.load_state_dict(state_dict)
+    model.requires_grad_(False)
+
+    param_count = sum(p.numel() for p in model.parameters())
+    print(f"modern_dllm model loaded: depth={depth}, seq_len={seq_len}, "
+          f"block_size={block_size}, params={param_count:,}, device={device}")
+
+    def model_fn(input_ids):
+        logits, _ = model(input_ids)
+        return logits
+
+    def tokenize_fn(text):
+        return mdllm.encode(text)
+
+    return model_fn, tokenize_fn, mdllm.mask_token_id, mdllm.pad_token_id, mdllm.block_size_seq
+
+
+# =============================================================================
 # Model Loading — HuggingFace AR
 # =============================================================================
 
@@ -361,14 +426,15 @@ def main():
 examples:
   python eval/base_eval.py --model dllm --depth 6
   python eval/base_eval.py --model block_dllm --depth 6 --block-size 4
+  python eval/base_eval.py --model modern_dllm --depth 8 --block-size 32
   python eval/base_eval.py --hf-model gpt2
   python eval/base_eval.py --hf-model gpt2 --max-per-task 50
 """,
     )
 
     parser.add_argument(
-        "--model", choices=["dllm", "block_dllm"],
-        help="Model type to score (dllm or block_dllm)",
+        "--model", choices=["dllm", "block_dllm", "modern_dllm"],
+        help="Model type to score (dllm, block_dllm, or modern_dllm)",
     )
     parser.add_argument(
         "--depth", type=int, default=6,
@@ -380,7 +446,11 @@ examples:
     )
     parser.add_argument(
         "--block-size", type=int, default=4,
-        help="Block size for block_dllm model (default: 4)",
+        help="Block size for block_dllm/modern_dllm model (default: 4)",
+    )
+    parser.add_argument(
+        "--seq-len", type=int, default=1024,
+        help="Sequence length for modern_dllm model (default: 1024)",
     )
     parser.add_argument(
         "--hf-model", type=str, default=None,
@@ -440,6 +510,18 @@ examples:
             )
         model_fn, tokenize_fn, mask_token_id, pad_token_id, max_seq_len = load_block_dllm_model(
             args.depth, args.block_size, weights_path, device
+        )
+        mode = "dllm"
+    elif args.model == "modern_dllm":
+        weights_path = args.weights
+        if weights_path is None:
+            repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            weights_path = os.path.join(
+                repo_root, "04_modern_dllm", "weights",
+                f"modern_dllm_d{args.depth}_b{args.block_size}.pt",
+            )
+        model_fn, tokenize_fn, mask_token_id, pad_token_id, max_seq_len = load_modern_dllm_model(
+            args.depth, args.seq_len, args.block_size, weights_path, device
         )
         mode = "dllm"
     else:
