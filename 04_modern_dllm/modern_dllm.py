@@ -20,7 +20,7 @@ Phase 4 changes from Phase 3 [P4]:
     [P4-12] Gradient accumulation for effective batch scaling
     [P4-13] torch.compile full model (Triton/inductor)
     [P4-14] DDP multi-GPU via torchrun
-    [P4-15] CUDA tuning (cudnn.benchmark, inference_mode, empty_cache)
+    [P4-15] CUDA tuning (cudnn.benchmark, no_grad, empty_cache)
     [P4-16] Qwen3-0.6B architecture (16L/1024d/16h/4kv/2816MLP, tied embeddings, MLP dropout)
     [P4-17] WSD scheduler (warmup-stable-decay, replaces cosine)
     [P4-18] Multi-source 100B dataset (FinePDFs+DCLM+FineWeb-Edu)
@@ -1081,7 +1081,7 @@ class Model(nn.Module):
 #   4. denoise_steps caps iterations per block (Phase 2 runs until all unmasked)
 #   5. After each block: one final forward pass with cache_mode=True to save K,V
 
-@torch.inference_mode()  # [P4-15] faster than no_grad (skips view tracking)
+@torch.no_grad()
 def generate(model, max_new_tokens=512, prompt=None, denoise_steps=10,
              temp=0.8, top_k=5, confidence_threshold=0.95):
     was_training = model.training
@@ -1223,7 +1223,7 @@ def generate(model, max_new_tokens=512, prompt=None, denoise_steps=10,
 # Evaluation
 # ============================================================================
 
-@torch.inference_mode()  # [P4-15]
+@torch.no_grad()
 def estimate_loss(model):
     out = {}
     was_training = model.training
