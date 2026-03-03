@@ -17,6 +17,12 @@ phase3 = [
     "datasets>=2.0.0",
     "tokenizers>=0.15.0",
 ]
+phase4 = [
+    "datasets>=2.0.0",
+    "tokenizers>=0.15.0",
+    "liger-kernel>=0.4.0",
+    "muon-optimizer @ git+https://github.com/KellerJordan/Muon",
+]
 eval = [
     "jinja2>=3.0.0",
     "pyyaml>=6.0.0",

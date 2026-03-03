@@ -73,8 +73,9 @@ except ImportError:
 
 # [P4-11] Muon optimizer: Newton-Schulz orthogonalization for 2D hidden weights.
 # ~50% less optimizer memory than AdamW, ~1.35x faster convergence.
+# pip install git+https://github.com/KellerJordan/Muon (NOT PyPI 'muon' which is bioinformatics)
 try:
-    from muon import MuonWithAuxAdam
+    from muon import MuonWithAuxAdam, SingleDeviceMuonWithAuxAdam
     MUON_AVAILABLE = True
 except ImportError:
     MUON_AVAILABLE = False
@@ -1380,6 +1381,7 @@ if __name__ == "__main__":
         # [P4-11] Muon optimizer: split params into Muon (2D hidden weights) and
         # AdamW (embeddings, lm_head, norms, biases). Muon uses Newton-Schulz
         # orthogonalization for ~50% less optimizer memory and faster convergence.
+        # MuonWithAuxAdam requires DDP; SingleDeviceMuonWithAuxAdam for single GPU.
         if use_muon:
             embed_names = {"token_emb.weight", "lm_head.weight"}
             muon_params, adam_params = [], []
@@ -1392,13 +1394,17 @@ if __name__ == "__main__":
                     muon_params.append(p)
                 else:
                     adam_params.append(p)
-            optimizer = MuonWithAuxAdam(
-                muon_params=muon_params, lr=0.02, momentum=0.95,
-                adam_params=adam_params, adam_lr=6e-4,
-                adam_betas=(0.9, 0.95), adam_wd=weight_decay,
-            )
+            param_groups = [
+                dict(params=muon_params, lr=0.02, momentum=0.95,
+                     weight_decay=weight_decay, use_muon=True),
+                dict(params=adam_params, lr=6e-4, betas=(0.9, 0.95),
+                     eps=1e-10, weight_decay=weight_decay, use_muon=False),
+            ]
+            MuonCls = MuonWithAuxAdam if ddp else SingleDeviceMuonWithAuxAdam
+            optimizer = MuonCls(param_groups)
             if master_process:
-                print(f"Muon optimizer: {len(muon_params)} Muon params, "
+                print(f"Muon optimizer ({MuonCls.__name__}): "
+                      f"{len(muon_params)} Muon params, "
                       f"{len(adam_params)} AdamW params")
         else:
             decay_params = [p for p in raw_model.parameters() if p.dim() >= 2]
