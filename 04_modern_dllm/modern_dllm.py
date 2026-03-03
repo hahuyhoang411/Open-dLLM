@@ -1428,6 +1428,18 @@ if __name__ == "__main__":
 
         effective_batch = 2 * batch_size * grad_accum_steps * ddp_world_size
 
+        # [P4-14] Preload datasets + cache staircase mask on ALL ranks before training.
+        # HF streaming dataset setup takes minutes — doing this inside the training loop
+        # causes DDP timeout (rank 1 waits at barrier while rank 0 loads datasets in eval).
+        if master_process:
+            print("Preloading datasets...")
+        get_batch("train")  # triggers _make_train_iter() + _cached_staircase_mask init
+        get_batch("val")    # triggers _make_val_iter()
+        if ddp:
+            dist.barrier()  # all ranks finish data loading before training
+        if master_process:
+            print("Datasets ready.")
+
         # Training loop
         t0 = time.time()
         for step in range(max_iters):
@@ -1436,24 +1448,21 @@ if __name__ == "__main__":
             for pg in optimizer.param_groups:
                 pg["lr"] = pg["initial_lr"] * lr_factor
 
-            # [P4-14] DDP: all ranks must sync before/after eval to prevent deadlock.
-            # Without barrier, rank 0 enters estimate_loss while rank 1 calls backward
-            # (which triggers NCCL all_reduce) — rank 0 never joins → NCCL timeout.
-            if ddp:
-                dist.barrier()
-            if master_process and (step % eval_interval == 0 or step == max_iters - 1):
+            # [P4-14] DDP eval: ALL ranks run estimate_loss (uses raw_model, no DDP ops)
+            # so no rank waits while another loads data or runs forward passes.
+            # Only master prints results and generates samples.
+            if step % eval_interval == 0 or step == max_iters - 1:
                 losses = estimate_loss(raw_model)
-                print(f"step {step:5d} | train loss {losses['train']:.4f} | "
-                      f"val loss {losses['val']:.4f} | lr_factor {lr_factor:.4f}")
-                if step > 0:
-                    sample = generate(raw_model, max_new_tokens=64, temp=0.8, top_k=5)
-                    print(f"--- sample ---\n{sample[:300]}\n--- end sample ---")
-                if "mps" in str(device):
-                    torch.mps.empty_cache()
-                elif "cuda" in str(device):
-                    torch.cuda.empty_cache()                               # [P4-15]
-            if ddp:
-                dist.barrier()
+                if master_process:
+                    print(f"step {step:5d} | train loss {losses['train']:.4f} | "
+                          f"val loss {losses['val']:.4f} | lr_factor {lr_factor:.4f}")
+                    if step > 0:
+                        sample = generate(raw_model, max_new_tokens=64, temp=0.8, top_k=5)
+                        print(f"--- sample ---\n{sample[:300]}\n--- end sample ---")
+                    if "mps" in str(device):
+                        torch.mps.empty_cache()
+                    elif "cuda" in str(device):
+                        torch.cuda.empty_cache()                           # [P4-15]
 
             # [P4-12] Gradient accumulation: accumulate gradients over micro-steps,
             # scale loss by 1/grad_accum_steps so total gradient magnitude is correct.
