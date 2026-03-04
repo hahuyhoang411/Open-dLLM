@@ -1492,8 +1492,9 @@ if __name__ == "__main__":
             if step % eval_interval == 0 or step == max_iters - 1:
                 losses = estimate_loss(raw_model)
                 if master_process:
+                    lr = optimizer.param_groups[0]["lr"]
                     print(f"step {step:5d} | train loss {losses['train']:.4f} | "
-                          f"val loss {losses['val']:.4f} | lr_factor {lr_factor:.4f}")
+                          f"val loss {losses['val']:.4f} | lr {lr:.6f}")
                     if step > 0:
                         sample = generate(raw_model, max_new_tokens=64, temp=0.8, top_k=5)
                         print(f"--- sample ---\n{sample[:300]}\n--- end sample ---")
