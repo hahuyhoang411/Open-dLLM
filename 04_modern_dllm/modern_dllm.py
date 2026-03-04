@@ -129,6 +129,8 @@ def parse_args():
                         help="enable CART noise rescheduling (default: off, use uniform 1/t)")
     parser.add_argument("--cart-p", type=float, default=0.1,                        # [P4-8]
                         help="CART geometric distribution parameter (default: 0.1)")
+    parser.add_argument("--no-grad-ckpt", action="store_true",                      # [P4-2]
+                        help="disable gradient checkpointing (faster but more VRAM)")
     parser.add_argument("--no-compile", action="store_true",                        # [P4-13]
                         help="disable torch.compile (skip Triton/inductor compilation)")
     parser.add_argument("--no-muon", action="store_true",                           # [P4-11]
@@ -217,6 +219,7 @@ use_liger = not args.no_liger and LIGER_AVAILABLE                          # [P4
 use_flex = not args.no_flex and FLEX_AVAILABLE and torch.cuda.is_available()  # [P4-6]
 use_cart = args.cart                                                       # [P4-8]
 cart_p = args.cart_p
+use_grad_ckpt = not args.no_grad_ckpt                                     # [P4-2]
 use_compile = not args.no_compile and torch.cuda.is_available()            # [P4-13]
 use_muon = not args.no_muon and MUON_AVAILABLE                             # [P4-11]
 grad_accum_steps = args.grad_accum_steps                                   # [P4-12]
@@ -862,8 +865,8 @@ class Block(nn.Module):
     def forward(self, x, cos_sin, attn_mask=None):
         # [P4-2] Gradient checkpointing: recompute activations during backward
         # instead of storing them. Saves ~60% peak activation memory at the cost
-        # of ~25% extra compute. Only active during training.
-        if self.training:
+        # of ~25% extra compute. Only active during training with use_grad_ckpt.
+        if self.training and use_grad_ckpt:
             return grad_checkpoint(self._forward, x, cos_sin, attn_mask,
                                    use_reentrant=False)
         return self._forward(x, cos_sin, attn_mask=attn_mask)
@@ -1467,6 +1470,13 @@ if __name__ == "__main__":
             dist.barrier()  # all ranks finish data loading before training
         if master_process:
             print("Datasets ready.")
+            if torch.cuda.is_available():
+                torch.cuda.reset_peak_memory_stats()
+                alloc = torch.cuda.memory_allocated() / 1e9
+                resv = torch.cuda.memory_reserved() / 1e9
+                total = torch.cuda.get_device_properties(0).total_memory / 1e9
+                print(f"VRAM before training: {alloc:.2f} GB allocated, "
+                      f"{resv:.2f} GB reserved, {total:.1f} GB total")
 
         # Training loop
         t0 = time.time()
@@ -1519,8 +1529,22 @@ if __name__ == "__main__":
             if master_process and step % 100 == 0 and step > 0:
                 dt = time.time() - t0
                 tokens_per_sec = (step * effective_batch * block_size_seq) / dt
+                vram_info = ""
+                if torch.cuda.is_available():
+                    peak = torch.cuda.max_memory_allocated() / 1e9
+                    alloc = torch.cuda.memory_allocated() / 1e9
+                    vram_info = f" | VRAM {alloc:.1f}/{peak:.1f} GB"
                 print(f"  step {step:5d} | loss {loss.item() * grad_accum_steps:.4f} "
-                      f"| {tokens_per_sec:.0f} tok/s")
+                      f"| {tokens_per_sec:.0f} tok/s{vram_info}")
+            # Log peak VRAM after first complete step
+            if step == 0 and master_process and torch.cuda.is_available():
+                peak = torch.cuda.max_memory_allocated() / 1e9
+                alloc = torch.cuda.memory_allocated() / 1e9
+                resv = torch.cuda.memory_reserved() / 1e9
+                total = torch.cuda.get_device_properties(0).total_memory / 1e9
+                print(f"VRAM after step 0: {alloc:.2f} GB allocated, "
+                      f"{peak:.2f} GB peak, {resv:.2f} GB reserved, "
+                      f"{total:.1f} GB total ({peak/total*100:.0f}% used)")
 
         # Save trained weights (master only, unwrapped model)
         if master_process:
