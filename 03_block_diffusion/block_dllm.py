@@ -1141,7 +1141,7 @@ if __name__ == "__main__":
             optimizer.zero_grad(set_to_none=True)
 
             # Progress indicator every 100 steps
-            if step % 100 == 0 and step > 0:
+            if step % 10 == 0 and step > 0:
                 dt = time.time() - t0
                 tokens_per_sec = (step * batch_size * block_size_seq) / dt
                 print(f"  step {step:5d} | loss {loss.item():.4f} | {tokens_per_sec:.0f} tok/s")

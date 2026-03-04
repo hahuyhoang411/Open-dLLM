@@ -1525,8 +1525,8 @@ if __name__ == "__main__":
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
 
-            # Progress indicator every 100 steps (master only)
-            if master_process and step % 100 == 0 and step > 0:
+            # Progress indicator every 10 steps (master only)
+            if master_process and step % 10 == 0 and step > 0:
                 dt = time.time() - t0
                 tokens_per_sec = (step * effective_batch * block_size_seq) / dt
                 vram_info = ""
