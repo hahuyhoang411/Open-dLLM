@@ -2,12 +2,12 @@
 modern_dllm.py — A modern block diffusion language model with fused kernels.
 
 Phase 4 of Open-dLLM: upgrades from Phase 3's block diffusion with modern
-training infrastructure: AMP fp16, gradient checkpointing, Liger fused
+training infrastructure: AMP bf16, gradient checkpointing, Liger fused
 kernels (RMSNorm, SwiGLU, FusedLinearCrossEntropy), mask ratio bandwidth,
-and complementary masking. Targets Kaggle T4 (CC 7.5, 16GB).
+and complementary masking. Targets 2xA10 (SM86, 24GB).
 
 Phase 4 changes from Phase 3 [P4]:
-    [P4-1] AMP fp16 + GradScaler for mixed precision training
+    [P4-1] AMP bf16 mixed precision training (no GradScaler needed)
     [P4-2] Gradient checkpointing per transformer block
     [P4-3] Liger fused kernels (SwiGLU, FusedLinearCrossEntropy)
     [P4-4] Mask ratio bandwidth: clamp t to [t_min, t_max]
@@ -58,6 +58,11 @@ import torch.distributed as dist                                       # [P4-14]
 from torch.nn.parallel import DistributedDataParallel as DDP           # [P4-14]
 from datasets import load_dataset
 from tokenizers import Tokenizer
+try:
+    import trackio
+    TRACKIO_AVAILABLE = True
+except ImportError:
+    TRACKIO_AVAILABLE = False
 
 # [P4-3] Liger fused kernels — drop-in replacements for PyTorch primitives.
 # FusedLinearCrossEntropy: never materializes the full (B*L, vocab) logit tensor.
@@ -105,28 +110,28 @@ def parse_args():
     parser.add_argument("--prompt", type=str, default=None, help="text prompt for generation")
     parser.add_argument("--max-tokens", type=int, default=512, help="max tokens to generate")
     # [P4-16] Architecture dims — explicit constants, configurable for exploration
-    parser.add_argument("--n-layer", type=int, default=16, help="number of transformer layers")
-    parser.add_argument("--n-embd", type=int, default=1024, help="embedding dimension")
-    parser.add_argument("--n-head", type=int, default=16, help="number of query heads")
-    parser.add_argument("--n-kv-head", type=int, default=4,                         # [P4-7]
-                        help="number of KV heads for GQA (default: 4 for 4:1 ratio)")
-    parser.add_argument("--mlp-hidden", type=int, default=2816, help="MLP hidden dimension")
-    parser.add_argument("--seq-len", type=int, default=1024,                        # [P4-6]
-                        help="sequence length in tokens (default: 1024)")
+    parser.add_argument("--n-layer", type=int, default=20, help="number of transformer layers")
+    parser.add_argument("--n-embd", type=int, default=768, help="embedding dimension")
+    parser.add_argument("--n-head", type=int, default=12, help="number of query heads")
+    parser.add_argument("--n-kv-head", type=int, default=3,                         # [P4-7]
+                        help="number of KV heads for GQA (default: 3 for 4:1 ratio)")
+    parser.add_argument("--mlp-hidden", type=int, default=1536, help="MLP hidden dimension")
+    parser.add_argument("--seq-len", type=int, default=2048,                        # [P4-6]
+                        help="sequence length in tokens (default: 2048)")
     parser.add_argument("--block-size", type=int, default=32, choices=[0, 1, 2, 4, 8, 16, 32],
                         help="block size for diffusion (0=full sequence)")
-    parser.add_argument("--batch-size", type=int, default=16,                       # [P4-6]
+    parser.add_argument("--batch-size", type=int, default=64,                       # [P4-6]
                         help="batch size per step (doubled by complementary masking)")
     parser.add_argument("--denoise-steps", type=int, default=10,
                         help="denoising steps per block during generation")
     parser.add_argument("--no-amp", action="store_true",                            # [P4-1]
-                        help="disable AMP fp16 (for debugging or CPU)")
+                        help="disable AMP bf16 (for debugging or CPU)")
     parser.add_argument("--no-liger", action="store_true",                          # [P4-3]
                         help="disable Liger fused kernels (use PyTorch fallbacks)")
     parser.add_argument("--no-flex", action="store_true",                           # [P4-6]
                         help="disable FlexAttention (use float staircase mask)")
     parser.add_argument("--cart", action="store_true",                               # [P4-8]
-                        help="enable CART noise rescheduling (default: off, use uniform 1/t)")
+                        help="enable CART noise rescheduling (default: off, use 1/mask_prob)")
     parser.add_argument("--cart-p", type=float, default=0.1,                        # [P4-8]
                         help="CART geometric distribution parameter (default: 0.1)")
     parser.add_argument("--no-grad-ckpt", action="store_true",                      # [P4-2]
@@ -135,10 +140,20 @@ def parse_args():
                         help="disable torch.compile (skip Triton/inductor compilation)")
     parser.add_argument("--no-muon", action="store_true",                           # [P4-11]
                         help="disable Muon optimizer (use AdamW for all params)")
-    parser.add_argument("--grad-accum-steps", type=int, default=4,                  # [P4-12]
-                        help="gradient accumulation steps (default: 4)")
+    parser.add_argument("--grad-accum-steps", type=int, default=1,                  # [P4-12]
+                        help="gradient accumulation steps (default: 1)")
     parser.add_argument("--dropout", type=float, default=0.1,                       # [P4-16]
                         help="MLP dropout rate (default: 0.1, 0 to disable)")
+    parser.add_argument("--resume", type=str, default=None,
+                        help="path to checkpoint dir to resume training from")
+    parser.add_argument("--trackio-space", type=str, default=None,
+                        help="HF Space ID for trackio dashboard (e.g. user/space)")
+    parser.add_argument("--ckpt-dir", type=str, default=None,
+                        help="directory for training checkpoints (default: weights/)")
+    parser.add_argument("--eval-every", type=int, default=1000,
+                        help="evaluate val/train loss every N steps (default: 1000)")
+    parser.add_argument("--ckpt-interval", type=int, default=250,
+                        help="save checkpoint every N steps (default: 250)")
     return parser.parse_args()
 
 args = parse_args()
@@ -176,8 +191,8 @@ if torch.cuda.is_available():
 # ============================================================================
 # Hyperparameters
 # ============================================================================
-# [P4-16] Qwen3-0.6B-inspired architecture, scaled to ~213M params for T4 16GB.
-# All dims configurable via CLI for exploration (defaults: 16L/1024d/16h/4kv/2816MLP).
+# [P4-16] Qwen3-0.6B-inspired architecture, scaled to ~125M params for A10 24GB.
+# All dims configurable via CLI for exploration (defaults: 20L/768d/12h/3kv/1536MLP).
 
 n_layer = args.n_layer
 n_embd = args.n_embd
@@ -198,12 +213,12 @@ assert block_size_seq % block_size_blk == 0, \
 # Training hyperparameters
 batch_size = args.batch_size
 max_iters = 50_000
-eval_interval = 1000
+eval_interval = args.eval_every
 eval_iters = 50
-learning_rate = 6e-4 * ddp_world_size  # [P4-14] linear scaling rule for DDP
+learning_rate = 6e-4  # base AdamW LR (Muon LR=0.02 is set separately in optimizer)
 warmup_iters = 2000
 decay_start = int(0.8 * max_iters)     # [P4-17] WSD: stable -> decay transition
-weight_decay = 0.1
+weight_decay = 0.3
 grad_clip = 1.0
 dropout = args.dropout                  # [P4-16] MLP dropout (Gao et al.)
 
@@ -329,7 +344,7 @@ def _make_val_iter():
     return iter(ds.skip(100_000))
 
 # [P4-8] CART: Context-Adaptive Rescheduling of Timesteps (Dream 7B, arXiv:2508.15487)
-# Replaces uniform 1/t ELBO weighting with context-adaptive weights.
+# Replaces uniform 1/mask_prob ELBO weighting with context-adaptive weights.
 # For each masked position, sums Geo(cart_p, |distance|) over all unmasked real tokens.
 # Tokens near context get higher scores -> lower loss weight (they're easier).
 # Tokens far from context get lower scores -> higher loss weight (harder, more signal).
@@ -366,7 +381,7 @@ def _compute_cart_weights(mask, padding, p=0.1):
     cart_scores = F.conv1d(ctx, kernel).squeeze(1)  # (B, L)
 
     # Inverse: less context -> higher weight (concentrate signal on hard tokens)
-    # Cap max weight to 1/t_min (=20), matching the uniform 1/t range.
+    # Cap max weight to 1/t_min (=20), bounding extreme ELBO weights.
     # Ref: Dream 7B (arXiv:2412.06264). Disabled by default; enable with --cart.
     return (1.0 / cart_scores.clamp(min=1e-4)).clamp(max=1.0 / t_min)
 
@@ -385,7 +400,7 @@ def get_batch(split="train"):
         x_input:   (2B, 2*L) — [x_t || x_0] with complementary masking    [P4-5]
         targets:   (2B, L)   — original unmasked token IDs
         mask:      (2B, L)   — True where noise-masked AND real token
-        elbo_w:    (2B, L)   — pre-computed ELBO weights (CART or 1/t)     [P4-8]
+        elbo_w:    (2B, L)   — pre-computed ELBO weights (CART or 1/mask_prob) [P4-8]
         attn_mask: BlockMask or (2L, 2L) float — staircase mask (cached)
     """
     global _train_iter, _val_iter, _cached_staircase_mask
@@ -501,13 +516,18 @@ def get_batch(split="train"):
     # Complementary sample uses 1-t (symmetric noise level)
     t_comp = 1.0 - t
 
-    # [P4-8] Pre-compute ELBO weights: either CART (context-adaptive) or uniform 1/t
+    # [P4-8] Pre-compute ELBO weights: either CART (context-adaptive) or 1/mask_prob.
+    # The correct importance weight for the cosine schedule is 1/mask_prob, NOT 1/t.
+    # With mask_prob = sin²(tπ/2), using 1/t under-weights low-noise timesteps by 4-8x,
+    # causing loss plateau at ~4.0. The weight 1/mask_prob makes every timestep contribute
+    # equally in expectation (importance sampling). Ref: LLaDA (arXiv:2502.09992).
     if use_cart:
         elbo_w = _compute_cart_weights(mask, padding, cart_p)
         elbo_w_comp = _compute_cart_weights(comp_mask, padding, cart_p)
     else:
-        elbo_w = 1.0 / t.clamp(min=1e-4)
-        elbo_w_comp = 1.0 / t_comp.clamp(min=1e-4)
+        elbo_w = 1.0 / mask_prob.clamp(min=1e-4)
+        mask_prob_comp = 1.0 - mask_prob                    # cos²(tπ/2)
+        elbo_w_comp = 1.0 / mask_prob_comp.clamp(min=1e-4)
 
     # Concatenate original + complement along batch dimension
     # Effective batch size doubles: 2*B samples per step
@@ -886,15 +906,15 @@ class Block(nn.Module):
 # Training forward pass:
 #   Input: [x_t || x_0] shape (B, 2L)
 #   Logits extracted from first half only: [:, :L]
-#   Loss computed on masked positions in x_t with per-token ELBO weight 1/t
+#   Loss computed on masked positions in x_t with per-token ELBO weight 1/mask_prob
 #
 # ELBO Loss with Per-Token Timesteps                                    [DIFF 2]
 # ==========================================
 #   Phase 2: t is (B,) — one timestep per sequence
 #   Phase 3: t is (B, L) — one timestep per token (each block has own noise)
 #
-#   Weight per token: 1/t[b, i], applied to per-token CE loss
-#   Loss = mean over all masked tokens of (1/t * CE)
+#   Weight per token: 1/mask_prob[b, i] (importance sampling for cosine schedule)
+#   Loss = mean over all real tokens of (mask * (1/mask_prob) * CE)
 
 class Model(nn.Module):
     def __init__(self):
@@ -905,8 +925,8 @@ class Model(nn.Module):
         self.emb_norm = _make_rms_norm(n_embd)      # [P4-9] post-embedding norm
 
         # Precompute rotary embeddings: 2x context length for training
-        # ([x_t || x_0]), or 4096 for long generation with KV cache
-        self.rotary_seq_len = max(block_size_seq * 2, 4096)
+        # ([x_t || x_0]), or 8192 for long generation with KV cache
+        self.rotary_seq_len = max(block_size_seq * 2, 8192)
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len)
         self.register_buffer("cos", cos, persistent=False)
         self.register_buffer("sin", sin, persistent=False)
@@ -920,7 +940,7 @@ class Model(nn.Module):
 
         self.apply(self._init_weights)
         # [P4-16] Tied embeddings: share input embeddings with output lm_head.
-        # Saves V*D = 32768*1024 = ~33.6M params. Must come AFTER _init_weights
+        # Saves V*D = 32768*768 = ~25.2M params. Must come AFTER _init_weights
         # so both get initialized, then the pointer is shared.
         self.lm_head.weight = self.token_emb.weight
 
@@ -1033,11 +1053,11 @@ class Model(nn.Module):
 
             if mask is not None and t is not None:
                 # [P4-8] t contains pre-computed ELBO weights from get_batch():
-                # either uniform 1/t or CART context-adaptive weights.
+                # either 1/mask_prob (cosine schedule) or CART context-adaptive weights.
                 elbo_weight = t  # (B, L) — pre-computed
 
                 # [P4-19] Normalize by ALL real tokens, not just masked ones.
-                # The 1/t importance weight already accounts for the masked fraction,
+                # The 1/mask_prob importance weight already accounts for the masked fraction,
                 # so dividing by N_masked double-counts (inflates loss ~3.3x).
                 # Ref: ZHZisZZ/dllm (maskable_mask.sum()), JinjieNi/MegaDLMs (loss_mask.sum())
                 weighted_loss = per_token_loss * mask.float() * elbo_weight  # (B, L)
@@ -1264,7 +1284,7 @@ def estimate_loss(model):
         for k in range(eval_iters):
             x_input, targets, mask, t, attn_mask = get_batch(split)
             # [P4-1] autocast during loss estimation to match training dtype
-            with torch.amp.autocast("cuda", enabled=use_amp):
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_amp):
                 _, loss = model(x_input, targets, mask, t, attn_mask)
             losses[k] = loss.item()
         out[split] = losses.mean().item()
@@ -1315,7 +1335,7 @@ def get_lr_factor(step):
 #        v
 #   model(x_input, targets, mask, t, attn_mask) -> loss
 #        |              [DIFF] masked positions with staircase mask
-#        v              [DIFF 2] ELBO weighted by per-token 1/t
+#        v              [DIFF 2] ELBO weighted by per-token 1/mask_prob
 #   loss.backward()
 #        |
 #        v
@@ -1334,6 +1354,48 @@ def get_lr_factor(step):
 # Weight decay is applied only to 2D+ parameters (weight matrices), not to
 # biases or normalization parameters (1D). This is standard practice: decaying
 # biases and norms hurts training stability with no regularization benefit.
+
+def save_checkpoint(raw_model, optimizer, step, loss, ckpt_dir):
+    import random
+    ckpt = {
+        "step": step,
+        "model_state_dict": raw_model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "rng_state": {
+            "python": random.getstate(),
+            "torch": torch.random.get_rng_state(),
+            "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+        },
+        "loss": loss,
+    }
+    import shutil
+    os.makedirs(ckpt_dir, exist_ok=True)
+    path = os.path.join(ckpt_dir, f"ckpt_step{step:06d}.pt")
+    torch.save(ckpt, path)
+    # Atomic update: write to tmp, then rename (survives preemption mid-write)
+    latest = os.path.join(ckpt_dir, "latest.pt")
+    tmp = latest + ".tmp"
+    torch.save(ckpt, tmp)
+    os.replace(tmp, latest)
+    return path
+
+
+def load_checkpoint(ckpt_dir, raw_model, optimizer, device):
+    import random
+    latest = os.path.join(ckpt_dir, "latest.pt")
+    if not os.path.exists(latest):
+        return -1  # caller distinguishes "no checkpoint" from "resume from step 0"
+    ckpt = torch.load(latest, map_location=device, weights_only=False)
+    raw_model.load_state_dict(ckpt["model_state_dict"])
+    optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+    rng = ckpt["rng_state"]
+    random.setstate(rng["python"])
+    # RNG state must be a CPU ByteTensor, but map_location may have moved it to CUDA
+    torch.random.set_rng_state(rng["torch"].cpu().byte())
+    if rng["cuda"] is not None and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all([s.cpu().byte() for s in rng["cuda"]])
+    return ckpt["step"] + 1
+
 
 if __name__ == "__main__":
 
@@ -1386,12 +1448,14 @@ if __name__ == "__main__":
                   f"{torch.cuda.max_memory_allocated() / 1e9:.2f} GB")
 
     # [P4-13] torch.compile: fuse operations via Triton/inductor for 20-40% speedup.
-    # reduce-overhead mode uses CUDA graphs — ideal for fixed-shape training tensors.
-    # Applied before DDP wrapping; compile is transparent to DDP.
+    # mode="default" (Inductor fusion only, no CUDA graphs) — standard for training.
+    # reduce-overhead uses CUDA graphs which pin ALL layer activations simultaneously,
+    # causing 7-10x memory overhead vs eager — only useful for inference (batch=1).
+    # dynamic=False since batch/seq shapes are fixed throughout training.
     if use_compile:
-        model = torch.compile(model, mode="reduce-overhead")
+        model = torch.compile(model, dynamic=False)
         if master_process:
-            print("torch.compile enabled (reduce-overhead mode)")
+            print("torch.compile enabled (default mode, dynamic=False)")
 
     # [P4-14] DDP wrapper: synchronizes gradients across GPUs after each backward pass.
     if ddp:
@@ -1452,10 +1516,20 @@ if __name__ == "__main__":
         for pg in optimizer.param_groups:
             pg["initial_lr"] = pg["lr"]
 
-        # [P4-1] AMP: GradScaler prevents fp16 gradient underflow by dynamically
-        # scaling the loss before backward. It checks for inf/NaN grads each step
-        # and adjusts the scale factor — no manual tuning needed.
-        scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+        # Resume from checkpoint if requested
+        ckpt_dir = args.ckpt_dir or args.resume or os.path.join(script_dir, "weights")
+        start_step = 0
+        if args.resume:
+            start_step = load_checkpoint(args.resume, raw_model, optimizer, device)
+            if start_step < 0:
+                start_step = 0
+                if master_process:
+                    print(f"No checkpoint at {args.resume}/latest.pt, starting fresh")
+            elif master_process:
+                print(f"Resumed from checkpoint at step {start_step}")
+
+        # [P4-1] AMP: BF16 has sufficient dynamic range (8 exp bits vs FP16's 5),
+        # so no GradScaler is needed — gradients won't underflow.
 
         effective_batch = 2 * batch_size * grad_accum_steps * ddp_world_size
 
@@ -1478,9 +1552,29 @@ if __name__ == "__main__":
                 print(f"VRAM before training: {alloc:.2f} GB allocated, "
                       f"{resv:.2f} GB reserved, {total:.1f} GB total")
 
+        # Trackio experiment tracking
+        if master_process and TRACKIO_AVAILABLE:
+            trackio_config = {
+                "n_layer": n_layer, "n_embd": n_embd, "n_head": n_head,
+                "n_kv_head": n_kv_head, "mlp_hidden": mlp_hidden,
+                "seq_len": block_size_seq, "block_size": block_size_blk,
+                "batch_size": effective_batch, "max_iters": max_iters,
+                "lr": learning_rate, "dropout": dropout,
+                "use_muon": use_muon, "use_cart": use_cart,
+                "ddp_world_size": ddp_world_size,
+            }
+            trackio_kwargs = {"project": "open-dllm-phase4", "config": trackio_config}
+            if args.trackio_space:
+                trackio_kwargs["space_id"] = args.trackio_space
+            try:
+                trackio.init(**trackio_kwargs)
+            except Exception as e:
+                print(f"WARNING: trackio init failed ({e}), continuing without tracking")
+                TRACKIO_AVAILABLE = False
+
         # Training loop
         t0 = time.time()
-        for step in range(max_iters):
+        for step in range(start_step, max_iters):
             # [P4-17] WSD schedule: factor * initial_lr per param group
             lr_factor = get_lr_factor(step)
             for pg in optimizer.param_groups:
@@ -1495,6 +1589,13 @@ if __name__ == "__main__":
                     lr = optimizer.param_groups[0]["lr"]
                     print(f"step {step:5d} | train loss {losses['train']:.4f} | "
                           f"val loss {losses['val']:.4f} | lr {lr:.6f}")
+                    if TRACKIO_AVAILABLE:
+                        trackio.log({
+                            "eval/train_loss": losses["train"],
+                            "eval/val_loss": losses["val"],
+                            "eval/lr": lr,
+                            "step": step,
+                        })
                     if step > 0:
                         sample = generate(raw_model, max_new_tokens=64, temp=0.8, top_k=5)
                         print(f"--- sample ---\n{sample[:300]}\n--- end sample ---")
@@ -1502,6 +1603,15 @@ if __name__ == "__main__":
                         torch.mps.empty_cache()
                     elif "cuda" in str(device):
                         torch.cuda.empty_cache()                           # [P4-15]
+
+            # Save checkpoint (decoupled from eval for preemption resilience)
+            if step > 0 and step % args.ckpt_interval == 0 and master_process:
+                ckpt_path = save_checkpoint(
+                    raw_model, optimizer, step,
+                    losses.get("val", 0.0) if step % eval_interval == 0 else 0.0,
+                    ckpt_dir
+                )
+                print(f"Saved checkpoint: {ckpt_path}")
 
             # [P4-12] Gradient accumulation: accumulate gradients over micro-steps,
             # scale loss by 1/grad_accum_steps so total gradient magnitude is correct.
@@ -1512,24 +1622,21 @@ if __name__ == "__main__":
                 ctx = model.no_sync() if no_sync else contextlib.nullcontext()
                 with ctx:
                     x_input, targets, mask, elbo_w, attn_mask = get_batch("train")
-                    with torch.amp.autocast("cuda", enabled=use_amp):
+                    with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_amp):
                         logits, loss = model(x_input, targets, mask, elbo_w, attn_mask)
                         loss = loss / grad_accum_steps
-                    scaler.scale(loss).backward()
+                    loss.backward()
 
-            # Gradient clipping: unscale first so clip threshold is in true gradient scale
-            scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
 
             # Optimizer step + zero gradients (set_to_none=True is faster than zeroing)
-            scaler.step(optimizer)
-            scaler.update()
+            optimizer.step()
             optimizer.zero_grad(set_to_none=True)
 
             # Progress indicator every 10 steps (master only)
             if master_process and step % 10 == 0 and step > 0:
                 dt = time.time() - t0
-                tokens_per_sec = (step * effective_batch * block_size_seq) / dt
+                tokens_per_sec = ((step - start_step) * effective_batch * block_size_seq) / dt
                 vram_info = ""
                 if torch.cuda.is_available():
                     peak = torch.cuda.max_memory_allocated() / 1e9
@@ -1537,8 +1644,15 @@ if __name__ == "__main__":
                     vram_info = f" | VRAM {alloc:.1f}/{peak:.1f} GB"
                 print(f"  step {step:5d} | loss {loss.item() * grad_accum_steps:.4f} "
                       f"| {tokens_per_sec:.0f} tok/s{vram_info}")
+                if TRACKIO_AVAILABLE:
+                    trackio.log({
+                        "train/loss": loss.item() * grad_accum_steps,
+                        "train/lr": optimizer.param_groups[0]["lr"],
+                        "train/tokens_per_sec": tokens_per_sec,
+                        "step": step,
+                    })
             # Log peak VRAM after first complete step
-            if step == 0 and master_process and torch.cuda.is_available():
+            if step == start_step and master_process and torch.cuda.is_available():
                 peak = torch.cuda.max_memory_allocated() / 1e9
                 alloc = torch.cuda.memory_allocated() / 1e9
                 resv = torch.cuda.memory_reserved() / 1e9
@@ -1547,10 +1661,13 @@ if __name__ == "__main__":
                       f"{peak:.2f} GB peak, {resv:.2f} GB reserved, "
                       f"{total:.1f} GB total ({peak/total*100:.0f}% used)")
 
-        # Save trained weights (master only, unwrapped model)
+        # Save final checkpoint + weights (master only, unwrapped model)
         if master_process:
+            save_checkpoint(raw_model, optimizer, max_iters, 0.0, ckpt_dir)
             torch.save(raw_model.state_dict(), weights_path)
             print(f"Saved weights to {weights_path}")
+        if master_process and TRACKIO_AVAILABLE:
+            trackio.finish()
 
     elif args.prompt is not None:
         # Generation requested but no weights found
