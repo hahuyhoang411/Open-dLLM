@@ -83,11 +83,22 @@
 
 ## DLM Loss Normalization (Phase 4)
 - Must divide by ALL real tokens (`targets != pad_token_id`), not just masked tokens
-- The 1/t importance weight already accounts for the masked fraction
-- Dividing by N_masked double-counts: loss inflated by E[1/t] ~ 3.27x for t ~ U[0.05, 0.95]
+- The 1/mask_prob importance weight already accounts for the masked fraction
+- Dividing by N_masked double-counts: loss inflated by E[1/mask_prob] for the given schedule
 - Ref: ZHZisZZ/dllm uses `maskable_mask.sum()` (all valid tokens)
 - Ref: JinjieNi/MegaDLMs uses `loss_mask.sum()` (similar effect)
 - Correct formula: `weighted_loss.sum() / real_count` where `real_count = (targets != pad_token_id).sum()`
+
+## ELBO Weight Must Match Noise Schedule (Phase 4) — CRITICAL
+- **The ELBO importance weight must be `1/mask_prob`, NOT `1/t`**
+- For LINEAR schedule (LLaDA): mask_prob = t, so 1/t is correct
+- For COSINE schedule (our code): mask_prob = sin²(tπ/2) ≠ t, so 1/t is WRONG
+- With 1/t on cosine schedule, low-noise timesteps (t=0.05) contribute 0.12x while high-noise contribute 1.08x
+- This 8x imbalance causes loss to plateau at ~4.0 after 1000 steps — model never learns fine-grained patterns
+- With 1/mask_prob, every timestep contributes exactly 1.0 (importance sampling cancellation)
+- Verified: `mask_prob * (1/mask_prob) = 1.0` at all t values
+- Ref: LLaDA (arXiv:2502.09992) uses `CE / p_mask` where p_mask = t (their linear schedule)
+- Rule: when borrowing loss formulas across papers, verify the weight matches YOUR noise schedule
 
 ## Gradient Clipping Starvation Pattern
 - Inflated loss → inflated gradients → grad_clip fires every step → very slow convergence
@@ -100,3 +111,21 @@
 - This is SEPARATE from user-facing `torch.compile(model)` — `--no-compile` doesn't disable it
 - On T4 (CC 7.5): hits Triton shared memory limit (65536 bytes)
 - Must use `--no-flex` flag on T4 to fall back to SDPA with manual mask
+
+## QK-Clip vs FlexAttention (Phase 5)
+- QK-Clip (MuonClip) relies on tracking max attention logit per forward pass
+- Original ms-swift approach: monkey-patch F.scaled_dot_product_attention to record ||q||*||k||*scale
+- FlexAttention uses compiled Triton kernels that bypass SDPA → monkey-patch is blind
+- Fix: compute upper bound directly in attention forward (after QK-norm, before dispatch)
+- With QK-norm (per-head RMSNorm), max logit ≈ sqrt(head_dim) ≈ 8, well below tau=100
+- QK-Clip is a safety net that rarely fires when QK-norm is active
+
+## Phase 5 Code Review Bugs Found
+- Missing `@torch.no_grad()` on `estimate_loss` → VRAM leak building computation graphs during eval
+- Uninitialized `losses` dict → NameError when resuming from checkpoint not aligned to eval_interval
+- Fallback attention mask (non-FlexAttention) doesn't enforce doc boundaries — only affects CPU/MPS testing
+- CART weight direction was inverted vs Dream reference — FIXED: now matches Dream (more context = higher weight)
+- Missing `set_cache_mode()` in model.py → `disable_kv_cache()` destroyed cache during generation — FIXED
+- Named checkpoint not atomic (no tmp+replace) — FIXED
+- `model.train()` not restored on exception in generate.py — FIXED: moved to finally block
+- Dead SDPA monkey-patch in `_MaxLogitsTracker.enable()` — FIXED: replaced with pass
