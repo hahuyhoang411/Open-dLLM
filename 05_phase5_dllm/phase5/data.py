@@ -222,10 +222,19 @@ class _PreTokenizedPacker:
         self._rng = np.random.RandomState(seed + rank)
         self._eos_id = config.eos_token_id
         self._buf = []
+        # Epoch-style iteration: permute indices, iterate without replacement
+        self._order = self._rng.permutation(self._n)
+        self._cursor = 0
 
     def _refill(self):
-        """Pull a batch of random documents into the buffer."""
-        indices = self._rng.randint(0, self._n, size=100).tolist()
+        """Pull next batch of documents (without replacement) into the buffer."""
+        if self._cursor >= self._n:
+            # Epoch boundary: reshuffle
+            self._order = self._rng.permutation(self._n)
+            self._cursor = 0
+        end = min(self._cursor + 100, self._n)
+        indices = self._order[self._cursor:end].tolist()
+        self._cursor = end
         batch = self._ds[indices]
         for ids in batch["input_ids"]:
             self._buf.extend(ids)  # already includes EOS
@@ -327,8 +336,9 @@ def get_batch(split='train'):
                     print('[data] Streaming mode (no --data-dir)')
         loader = _train_loader
     else:
-        if _val_packer is None:
-            _val_packer = _DocumentPacker(_make_val_iter)
+        # Reset val packer each eval to measure on the same data every time.
+        # Streaming from .skip(100_000) is deterministic — same seed, same order.
+        _val_packer = _DocumentPacker(_make_val_iter)
         loader = _val_packer
 
     # Build (targets, doc_ids) — vectorized for sharded, loop for streaming

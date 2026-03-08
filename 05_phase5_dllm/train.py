@@ -304,7 +304,8 @@ if __name__ == '__main__':
 
             # Periodic evaluation
             if step % config.eval_interval == 0 or step == config.max_iters - 1:
-                losses = estimate_loss(raw_model, get_batch)
+                with disable_fp8(raw_model) if config.use_fp8 else contextlib.nullcontext():
+                    losses = estimate_loss(raw_model, get_batch)
                 # Step-0 sanity check: catch broken normalization/ELBO before burning GPU
                 # With SmolLM2 init (std=1/√576), ELBO-weighted loss is ~19-20 at step 0
                 # because mask_token_id=0 inputs produce higher CE than real tokens.
@@ -451,11 +452,12 @@ if __name__ == '__main__':
 
     # --- 5. Generate text ---
     if config.master_process and config.args.prompt is not None:
-        sample = generate(raw_model, encode, decode,
-                          prompt=config.args.prompt,
-                          max_new_tokens=config.args.max_tokens,
-                          denoise_steps=config.args.denoise_steps,
-                          temperature=0.8, top_k=5)
+        with disable_fp8(raw_model) if config.use_fp8 else contextlib.nullcontext():
+            sample = generate(raw_model, encode, decode,
+                              prompt=config.args.prompt,
+                              max_new_tokens=config.args.max_tokens,
+                              denoise_steps=config.args.denoise_steps,
+                              temperature=0.8, top_k=5)
         print(sample)
 
     if config.ddp:

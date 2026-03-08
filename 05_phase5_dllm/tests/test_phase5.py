@@ -247,15 +247,17 @@ class TestModel:
             assert (block.attn.w_gate.weight == 0).all()
 
     def test_forward_training(self):
-        """Training forward: [x_t || x_0] input, loss output."""
+        """Training forward: [x_t || x_0] input, hidden states + external loss."""
         B, L = 2, 64
         x_input = torch.randint(0, 49152, (B, 2 * L))
         targets = torch.randint(14, 49152, (B, L))
         mask = torch.rand(B, L) > 0.5
         elbo_w = torch.ones(B, L)
         attn_mask = build_staircase_mask(L, config.block_size)
-        _, loss = self.m(x_input, targets=targets, mask=mask, elbo_weight=elbo_w, attn_mask=attn_mask)
-        assert loss is not None
+        hidden, out = self.m(x_input, targets=targets, attn_mask=attn_mask)
+        assert hidden.shape == (B, L, config.n_embd)
+        assert out is None  # loss computed externally in Phase 5
+        loss = compute_loss(hidden, targets, mask, elbo_w, self.m.lm_head.weight)
         assert loss.item() > 0
 
     def test_forward_inference(self):
@@ -749,7 +751,8 @@ class TestIntegration:
         x_input = torch.cat([x_noisy, targets], dim=1)
         attn_mask = build_staircase_mask(L, config.block_size)
 
-        _, loss = m(x_input, targets=targets, mask=mask, elbo_weight=elbo_w, attn_mask=attn_mask)
+        hidden, _ = m(x_input, targets=targets, attn_mask=attn_mask)
+        loss = compute_loss(hidden, targets, mask, elbo_w, m.lm_head.weight)
         assert loss.item() > 0
         assert not torch.isnan(loss) and not torch.isinf(loss)
 
@@ -782,7 +785,7 @@ class TestIntegration:
         x_input = torch.cat([x_noisy, targets], dim=1)
         attn_mask = build_staircase_mask(L, config.block_size, doc_ids=doc_ids)
 
-        _, loss = m(x_input, targets=targets, mask=mask, elbo_weight=elbo_w,
-                    attn_mask=attn_mask, positions=positions)
+        hidden, _ = m(x_input, targets=targets, attn_mask=attn_mask, positions=positions)
+        loss = compute_loss(hidden, targets, mask, elbo_w, m.lm_head.weight)
         assert loss.item() > 0
         assert not torch.isnan(loss) and not torch.isinf(loss)
