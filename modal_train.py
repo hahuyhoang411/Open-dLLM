@@ -24,9 +24,9 @@ Usage:
     # Download checkpoint from a run
     modal volume get dllm-checkpoints phase5/20260307_212400/latest.pt ./latest.pt
 
-    # Pre-tokenize dataset (run BEFORE training for best throughput)
+    # Pre-tokenize dataset and push to HF Hub
     modal run modal_train.py::pretokenize
-    modal run modal_train.py::pretokenize --max-tokens 20000000000
+    modal run modal_train.py::pretokenize --max-docs 100000
 """
 
 import modal
@@ -91,8 +91,13 @@ class Train:
 
         # Auto-detect pre-tokenized data
         tokenized_dir = "/data/tokenized"
+        hub_repo = "HoangHa/100BT-dLLM-pretokenized"
         if os.path.exists(os.path.join(tokenized_dir, "meta.json")):
+            # Local numpy shards (legacy)
             cmd.append(f"--data-dir={tokenized_dir}")
+        else:
+            # HF Hub dataset — load_dataset handles caching
+            cmd.append(f"--data-dir={hub_repo}")
 
         if trackio_space:
             cmd.append(f"--trackio-space={trackio_space}")
@@ -184,24 +189,26 @@ def debug(run_id: str = "", ckpt_name: str = ""):
 
 @app.function(
     image=image,
-    cpu=8,
+    cpu=16,
     timeout=86400,
     volumes={"/data": data_vol},
     secrets=[modal.Secret.from_name("huggingface-secret")],
 )
-def pretokenize(max_tokens: int = 0):
+def pretokenize(max_docs: int = 0, hub_repo: str = "HoangHa/100BT-dLLM-pretokenized"):
     import os
     import subprocess
 
     os.environ["HF_HOME"] = "/data"
     os.environ["HF_DATASETS_CACHE"] = "/data/datasets"
+    os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
     cmd = [
         "python", "/root/05_phase5_dllm/pretokenize.py",
-        "--out-dir", "/data/tokenized",
+        f"--hub-repo={hub_repo}",
+        "--num-proc=16",
     ]
-    if max_tokens > 0:
-        cmd.extend(["--max-tokens", str(max_tokens)])
+    if max_docs > 0:
+        cmd.extend(["--max-docs", str(max_docs)])
 
     print(f"Running: {' '.join(cmd)}")
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
@@ -213,6 +220,16 @@ def pretokenize(max_tokens: int = 0):
 
     if proc.returncode != 0:
         raise subprocess.CalledProcessError(proc.returncode, cmd)
+
+    # Cleanup: remove intermediate Arrow cache to free volume space
+    import shutil
+    cache_dir = "/data/datasets"
+    for item in os.listdir(cache_dir):
+        path = os.path.join(cache_dir, item)
+        if os.path.isdir(path) and "finepdfs" in item:
+            print(f"Cleaning up source cache: {path}")
+            shutil.rmtree(path)
+    data_vol.commit()
 
 
 @app.function(

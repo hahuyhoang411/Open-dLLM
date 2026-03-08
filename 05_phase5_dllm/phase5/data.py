@@ -4,9 +4,10 @@ No right-padding — every position is a real token. Multiple documents packed
 per sequence with EOS boundaries, doc-aware attention masking, and RoPE
 position reset at document boundaries.
 
-Supports two modes:
-1. Streaming: HF dataset -> tokenize on-the-fly -> pack (default)
-2. Sharded: pre-tokenized numpy files -> random-access batches (--data-dir)
+Supports three modes:
+1. Streaming: HF dataset -> tokenize on-the-fly -> pack (default, no --data-dir)
+2. Sharded: pre-tokenized numpy files -> random-access batches (--data-dir with meta.json)
+3. HF Hub: pre-tokenized HF dataset -> batch random access -> pack (--data-dir with HF repo ID)
 """
 
 import glob
@@ -200,6 +201,55 @@ class _ShardedLoader:
 
 
 # ============================================================================
+# Pre-Tokenized HF Hub Loader
+# ============================================================================
+
+class _PreTokenizedPacker:
+    """Packs pre-tokenized HF dataset documents into fixed-length sequences.
+
+    Reads from cached Arrow files (downloaded from Hub on first use).
+    Each document is already tokenized with trailing EOS.
+    Packing into config.seq_len happens here — works for any seq_len.
+    """
+
+    def __init__(self, dataset_id, rank=0, world_size=1, seed=42):
+        from datasets import load_dataset as _load_ds
+        ds = _load_ds(dataset_id, split='train')
+        if world_size > 1:
+            ds = ds.shard(num_shards=world_size, index=rank, contiguous=True)
+        self._ds = ds
+        self._n = len(ds)
+        self._rng = np.random.RandomState(seed + rank)
+        self._eos_id = config.eos_token_id
+        self._buf = []
+
+    def _refill(self):
+        """Pull a batch of random documents into the buffer."""
+        indices = self._rng.randint(0, self._n, size=100).tolist()
+        batch = self._ds[indices]
+        for ids in batch["input_ids"]:
+            self._buf.extend(ids)  # already includes EOS
+
+    def get_sequence(self):
+        """Return one packed sequence of exactly seq_len tokens."""
+        while len(self._buf) < config.seq_len:
+            self._refill()
+
+        token_ids = self._buf[:config.seq_len]
+        self._buf = self._buf[config.seq_len:]
+
+        # Reconstruct doc_ids from EOS positions
+        doc_ids = []
+        doc_id = 0
+        for tid in token_ids:
+            doc_ids.append(doc_id)
+            if tid == self._eos_id:
+                doc_id += 1
+
+        return token_ids, doc_ids
+
+
+# ============================================================================
 # Position Computation (vectorized)
 # ============================================================================
 
@@ -246,18 +296,32 @@ def get_batch(split='train'):
 
     if split == 'train':
         if _train_loader is None:
-            if config.data_dir and os.path.exists(os.path.join(config.data_dir, 'meta.json')):
-                _train_loader = _ShardedLoader(
-                    config.data_dir,
-                    rank=config.ddp_rank,
-                    world_size=config.ddp_world_size,
-                )
-                if config.master_process:
-                    m = _train_loader.meta
-                    print(f'[data] Sharded: {m["n_shards"]} shards, '
-                          f'{m["total_tokens"]/1e9:.1f}B tokens, '
-                          f'{len(_train_loader.shard_paths)} shards/rank')
+            if config.data_dir:
+                if os.path.isdir(config.data_dir) and os.path.exists(
+                    os.path.join(config.data_dir, 'meta.json')
+                ):
+                    # Mode 1: local numpy shards (backward compat)
+                    _train_loader = _ShardedLoader(
+                        config.data_dir,
+                        rank=config.ddp_rank,
+                        world_size=config.ddp_world_size,
+                    )
+                    if config.master_process:
+                        m = _train_loader.meta
+                        print(f'[data] Sharded: {m["n_shards"]} shards, '
+                              f'{m["total_tokens"]/1e9:.1f}B tokens')
+                else:
+                    # Mode 2: HF Hub dataset (or local HF cache)
+                    _train_loader = _PreTokenizedPacker(
+                        config.data_dir,
+                        rank=config.ddp_rank,
+                        world_size=config.ddp_world_size,
+                    )
+                    if config.master_process:
+                        print(f'[data] Pre-tokenized: {_train_loader._n:,} docs '
+                              f'from {config.data_dir}')
             else:
+                # Mode 3: streaming + on-the-fly tokenization
                 _train_loader = _DocumentPacker(_make_train_iter)
                 if config.master_process:
                     print('[data] Streaming mode (no --data-dir)')
