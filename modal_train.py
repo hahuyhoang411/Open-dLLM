@@ -51,7 +51,7 @@ data_vol = modal.Volume.from_name("dllm-data", create_if_missing=True)
 
 @app.cls(
     image=image,
-    gpu="A100-80GB:8",
+    gpu="H100:8",
     timeout=86400,
     retries=modal.Retries(max_retries=4, initial_delay=0.0),
     volumes={"/checkpoints": ckpt_vol, "/data": data_vol},
@@ -85,6 +85,7 @@ class Train:
         cmd = [
             *launcher,
             "/root/05_phase5_dllm/train.py", "--train",
+            "--fp8", "--batch-size", "256",
             f"--ckpt-dir={ckpt_dir}",
             f"--resume={ckpt_dir}",
         ]
@@ -243,7 +244,7 @@ def download():
 
 @app.local_entrypoint()
 def main(
-    gpu: str = "A100-80GB:8",
+    gpu: str = "H100:8",
     trackio_space: str = "",
     extra_args: str = "",
     run_id: str = "",

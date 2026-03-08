@@ -43,6 +43,8 @@
 - Phase 5 doc packing: no right-padding, attention masked at doc boundaries, RoPE resets per-doc
 - Phase 5 noise schedule: t ~ U[0.1, 1.0] (default `--t-min 0.1`), ELBO weight capped at 10. Per-block min-1-masked guarantee.
 - Phase 5 expected step-0 loss: ~19-20 (ELBO-weighted; raw CE ~9.6 < ln(49152)=10.80). Threshold is 25. Mask tokens produce higher CE at init due to SmolLM2's wider init std
+- Phase 5 FP8: `--fp8` enables FP8 matmuls on H100+ (nanochat-style, NOT torchao). All layer dims divisible by 16. Uses `@allow_in_graph` to avoid torchao + grad_ckpt 3x slowdown.
+- Phase 5 FP8: lm_head skipped in FP8 conversion (weight accessed directly in loss.py). `disable_fp8()` context manager for generation.
 - Weights at `05_phase5_dllm/weights/phase5_dllm_b{block_size}.pt`
 
 ## Training Run Monitoring — MANDATORY

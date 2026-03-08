@@ -670,6 +670,66 @@ class TestCART:
 
 
 # ============================================================================
+# FP8 Tests
+# ============================================================================
+
+class TestFP8:
+    def test_float8_linear_from_float(self):
+        """Float8Linear.from_float shares weight with original module."""
+        from phase5.fp8 import Float8Linear
+        linear = torch.nn.Linear(576, 1536, bias=False)
+        fp8 = Float8Linear.from_float(linear)
+        assert fp8.weight is linear.weight
+        assert fp8.weight.data_ptr() == linear.weight.data_ptr()
+
+    def test_convert_counts(self):
+        """convert_to_float8_training converts the right number of layers."""
+        from phase5.fp8 import Float8Linear, convert_to_float8_training
+        torch.manual_seed(42)
+        m = Model()
+        convert_to_float8_training(m, module_filter_fn=lambda mod, fqn: fqn != 'lm_head')
+        num_fp8 = sum(1 for mod in m.modules() if isinstance(mod, Float8Linear))
+        # 8 linear layers per block x n_layer blocks
+        # Per block: c_q, c_k, c_v, c_proj, w_gate + gate_proj, up_proj, down_proj = 8
+        assert num_fp8 == 8 * config.n_layer, f'Expected {8 * config.n_layer} FP8, got {num_fp8}'
+        assert isinstance(m.lm_head, torch.nn.Linear)
+        assert not isinstance(m.lm_head, Float8Linear)
+
+    def test_disable_fp8_restores(self):
+        """disable_fp8 context manager swaps modules and restores them."""
+        from phase5.fp8 import Float8Linear, convert_to_float8_training, disable_fp8
+        torch.manual_seed(42)
+        m = Model()
+        convert_to_float8_training(m)
+        assert isinstance(m.blocks[0].attn.c_q, Float8Linear)
+        with disable_fp8(m):
+            assert not isinstance(m.blocks[0].attn.c_q, Float8Linear)
+            assert isinstance(m.blocks[0].attn.c_q, torch.nn.Linear)
+        assert isinstance(m.blocks[0].attn.c_q, Float8Linear)
+
+    def test_fp8_module_structure(self):
+        """Float8Linear has correct in/out features and shared weight."""
+        from phase5.fp8 import Float8Linear
+        linear = torch.nn.Linear(576, 576, bias=False)
+        fp8 = Float8Linear.from_float(linear)
+        assert fp8.in_features == 576
+        assert fp8.out_features == 576
+        assert fp8.weight is linear.weight
+
+    def test_optimizer_after_fp8_conversion(self):
+        """Optimizer params still reference correct tensors after FP8 conversion."""
+        from phase5.fp8 import convert_to_float8_training
+        torch.manual_seed(42)
+        m = Model()
+        opt = build_adamw_optimizer(m)
+        q_weight_ptr = m.blocks[0].attn.c_q.weight.data_ptr()
+        convert_to_float8_training(m, module_filter_fn=lambda mod, fqn: fqn != 'lm_head')
+        assert m.blocks[0].attn.c_q.weight.data_ptr() == q_weight_ptr
+        opt_ptrs = {p.data_ptr() for g in opt.param_groups for p in g['params']}
+        assert q_weight_ptr in opt_ptrs
+
+
+# ============================================================================
 # Integration Test
 # ============================================================================
 

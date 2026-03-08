@@ -43,6 +43,7 @@ def parse_args():
     p.add_argument('--no-grad-ckpt', action='store_true', help='disable gradient checkpointing')
     p.add_argument('--no-compile', action='store_true', help='disable torch.compile')
     p.add_argument('--no-muon', action='store_true', help='use plain AdamW (no MuonClip)')
+    p.add_argument('--fp8', action='store_true', help='enable FP8 training (requires H100+ GPU)')
     p.add_argument('--cart', action='store_true', help='enable CART noise rescheduling (SFT only)')
     p.add_argument('--cart-p', type=float, default=0.1, help='CART geometric param')
     p.add_argument('--t-min', type=float, default=0.1, help='min timestep (caps ELBO weight at 1/t_min)')
@@ -196,3 +197,4 @@ use_compile = not args.no_compile and torch.cuda.is_available()
 use_liger = not args.no_liger and _LIGER_AVAILABLE and use_grad_ckpt
 use_flex = not args.no_flex and _FLEX_AVAILABLE and torch.cuda.is_available()
 use_muon = not args.no_muon
+use_fp8 = args.fp8 and torch.cuda.is_available()

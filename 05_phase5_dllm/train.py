@@ -19,6 +19,7 @@ import time
 
 import torch
 import torch.distributed as dist
+import torch.nn as nn
 
 # Phase 5 modules
 from phase5 import config
@@ -27,6 +28,7 @@ from phase5.checkpoint import load_checkpoint, save_checkpoint
 from phase5.generate import generate
 from phase5.loss import compute_loss
 from phase5.model import Model
+from phase5.fp8 import convert_to_float8_training, disable_fp8
 from phase5.optim import build_adamw_optimizer, build_param_groups
 from phase5.schedule import get_lr_factor
 from phase5.tokenizer import decode, encode
@@ -155,6 +157,7 @@ if __name__ == '__main__':
         print(f'  use_compile    = {config.use_compile} ({compile_mode})')
         print(f'  use_grad_ckpt  = {config.use_grad_ckpt}')
         print(f'  use_muon       = {config.use_muon}')
+        print(f'  use_fp8        = {config.use_fp8}')
         print('  noise_schedule = linear (ELBO weight = 1/t)')
         print('  doc_packing    = True')
         print('  gated_query    = True (arXiv:2505.06708)')
@@ -209,6 +212,24 @@ if __name__ == '__main__':
                     print(f'No checkpoint at {config.args.resume}, starting fresh')
             elif config.master_process:
                 print(f'Resumed from step {start_step}')
+
+        # FP8 conversion (before compile — Dynamo sees Float8Linear, not nn.Linear)
+        if config.use_fp8:
+            def _fp8_filter(mod, fqn):
+                if not isinstance(mod, nn.Linear):
+                    return False
+                if mod.in_features % 16 != 0 or mod.out_features % 16 != 0:
+                    return False
+                if fqn == 'lm_head':
+                    return False
+                return True
+
+            from phase5.fp8 import Float8Linear
+            num_linear = sum(1 for m in raw_model.modules() if isinstance(m, nn.Linear))
+            convert_to_float8_training(raw_model, module_filter_fn=_fp8_filter)
+            num_fp8 = sum(1 for m in raw_model.modules() if isinstance(m, Float8Linear))
+            if config.master_process:
+                print(f'FP8 training: converted {num_fp8}/{num_linear} linear layers')
 
         # Compile AFTER checkpoint loaded (torchtitan order: AC → load → compile → DDP)
         # Without grad_ckpt: whole-model compile (cross-block fusion, fewer kernel launches)
@@ -304,9 +325,10 @@ if __name__ == '__main__':
                             'eval_lr': lr,
                         })
                     if step > 0:
-                        sample = generate(raw_model, encode, decode,
-                                          prompt='Vietnam, officially the Socialist Republic of Vietnam, is a country',
-                                          max_new_tokens=64, temperature=0.8, top_k=5)
+                        with disable_fp8(raw_model) if config.use_fp8 else contextlib.nullcontext():
+                            sample = generate(raw_model, encode, decode,
+                                              prompt='Vietnam, officially the Socialist Republic of Vietnam, is a country',
+                                              max_new_tokens=64, temperature=0.8, top_k=5)
                         print(f'--- sample ---\n{sample[:300]}\n--- end sample ---')
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
