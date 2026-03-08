@@ -24,6 +24,11 @@ Usage:
     # Download checkpoint from a run
     modal volume get dllm-checkpoints phase5/20260307_212400/latest.pt ./latest.pt
 
+    # Data sources (--data-dir flag):
+    modal run modal_train.py                                              # HF Hub pre-tokenized (default)
+    modal run modal_train.py --data-dir streaming                         # on-the-fly tokenization
+    modal run modal_train.py --data-dir HoangHa/other-dataset             # different HF dataset
+
     # Pre-tokenize dataset and push to HF Hub
     modal run modal_train.py::pretokenize
     modal run modal_train.py::pretokenize --max-docs 100000
@@ -64,6 +69,7 @@ class Train:
         trackio_space: str = "",
         extra_args: str = "",
         run_id: str = "",
+        data_dir: str = "HoangHa/100BT-dLLM-pretokenized",
     ):
         import os
         import subprocess
@@ -85,20 +91,14 @@ class Train:
         cmd = [
             *launcher,
             "/root/05_phase5_dllm/train.py", "--train",
-            "--fp8", "--batch-size", "256",
+            "--fp8",
             f"--ckpt-dir={ckpt_dir}",
             f"--resume={ckpt_dir}",
         ]
 
-        # Auto-detect pre-tokenized data
-        tokenized_dir = "/data/tokenized"
-        hub_repo = "HoangHa/100BT-dLLM-pretokenized"
-        if os.path.exists(os.path.join(tokenized_dir, "meta.json")):
-            # Local numpy shards (legacy)
-            cmd.append(f"--data-dir={tokenized_dir}")
-        else:
-            # HF Hub dataset — load_dataset handles caching
-            cmd.append(f"--data-dir={hub_repo}")
+        # Data source: "streaming" = on-the-fly, anything else = --data-dir value
+        if data_dir and data_dir != "streaming":
+            cmd.append(f"--data-dir={data_dir}")
 
         if trackio_space:
             cmd.append(f"--trackio-space={trackio_space}")
@@ -248,6 +248,7 @@ def main(
     trackio_space: str = "",
     extra_args: str = "",
     run_id: str = "",
+    data_dir: str = "HoangHa/100BT-dLLM-pretokenized",
 ):
     if not run_id:
         import datetime
@@ -255,4 +256,5 @@ def main(
     print(f"Run ID: {run_id}  (checkpoints at /checkpoints/phase5/{run_id}/)")
     Train.with_options(gpu=gpu)().run.remote(
         trackio_space=trackio_space, extra_args=extra_args, run_id=run_id,
+        data_dir=data_dir,
     )

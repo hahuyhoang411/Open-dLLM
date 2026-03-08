@@ -48,7 +48,7 @@ def parse_args():
     p.add_argument('--cart-p', type=float, default=0.1, help='CART geometric param')
     p.add_argument('--t-min', type=float, default=0.1, help='min timestep (caps ELBO weight at 1/t_min)')
     # Data
-    p.add_argument('--data-dir', type=str, default=None, help='pre-tokenized shard directory')
+    p.add_argument('--data-dir', type=str, default=None, help='HF Hub dataset ID (omit for streaming)')
     # Checkpointing
     p.add_argument('--resume', type=str, default=None, help='checkpoint dir to resume from')
     p.add_argument('--max-iters', type=int, default=50_000, help='total training steps')

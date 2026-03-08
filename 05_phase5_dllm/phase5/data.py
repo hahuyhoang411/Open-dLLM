@@ -4,16 +4,10 @@ No right-padding — every position is a real token. Multiple documents packed
 per sequence with EOS boundaries, doc-aware attention masking, and RoPE
 position reset at document boundaries.
 
-Supports three modes:
+Supports two modes:
 1. Streaming: HF dataset -> tokenize on-the-fly -> pack (default, no --data-dir)
-2. Sharded: pre-tokenized numpy files -> random-access batches (--data-dir with meta.json)
-3. HF Hub: pre-tokenized HF dataset -> batch random access -> pack (--data-dir with HF repo ID)
+2. HF Hub: pre-tokenized HF dataset -> batch random access -> pack (--data-dir with HF repo ID)
 """
-
-import glob
-import json
-import os
-import threading
 
 import numpy as np
 import torch
@@ -101,103 +95,6 @@ class _DocumentPacker:
             remapped.append(seen[d])
 
         return token_ids, remapped
-
-
-# ============================================================================
-# Sharded Loader (pre-tokenized mode)
-# ============================================================================
-
-class _ShardedLoader:
-    """Fast random-access loader from pre-tokenized numpy shards.
-
-    Shards are .npy files of shape (N, seq_len), dtype uint16.
-    Doc boundaries are reconstructed from EOS positions at load time.
-    Background thread preloads next shard to hide I/O latency.
-    """
-
-    def __init__(self, shard_dir, rank=0, world_size=1, seed=42):
-        with open(os.path.join(shard_dir, 'meta.json')) as f:
-            self.meta = json.load(f)
-
-        self.eos_id = self.meta['eos_token_id']
-
-        all_shards = sorted(glob.glob(os.path.join(shard_dir, 'shard_*.npy')))
-        self.shard_paths = all_shards[rank::world_size]
-        assert self.shard_paths, f'No shards for rank {rank}/{world_size} ({len(all_shards)} total)'
-
-        self._rng = np.random.RandomState(seed + rank)
-        self._rng.shuffle(self.shard_paths)
-
-        self._shard_idx = 0
-        self._row_idx = 0
-        self._current_data = None
-        self._row_order = None
-        self._epoch = 0
-
-        self._next_data = None
-        self._preload_thread = None
-        self._load_current_shard()
-        self._start_preload()
-
-    def _load_current_shard(self):
-        self._current_data = np.load(self.shard_paths[self._shard_idx])
-        n = self._current_data.shape[0]
-        self._row_order = self._rng.permutation(n)
-        self._row_idx = 0
-
-    def _start_preload(self):
-        """Preload next shard in background thread."""
-        next_idx = (self._shard_idx + 1) % len(self.shard_paths)
-        path = self.shard_paths[next_idx]
-
-        def _load():
-            self._next_data = np.load(path)
-
-        self._preload_thread = threading.Thread(target=_load, daemon=True)
-        self._preload_thread.start()
-
-    def _advance_shard(self):
-        """Switch to next shard (preloaded in background)."""
-        self._shard_idx = (self._shard_idx + 1) % len(self.shard_paths)
-        if self._shard_idx == 0:
-            self._epoch += 1
-            self._rng.shuffle(self.shard_paths)
-
-        if self._preload_thread:
-            self._preload_thread.join()
-
-        self._current_data = self._next_data
-        n = self._current_data.shape[0]
-        self._row_order = self._rng.permutation(n)
-        self._row_idx = 0
-        self._start_preload()
-
-    def get_batch_tensors(self, batch_size):
-        """Return (targets, doc_ids) tensors directly. Vectorized fast path."""
-        chunks = []
-        remaining = batch_size
-
-        while remaining > 0:
-            if self._row_idx >= len(self._row_order):
-                self._advance_shard()
-
-            available = len(self._row_order) - self._row_idx
-            take = min(available, remaining)
-            rows = self._row_order[self._row_idx:self._row_idx + take]
-            chunks.append(self._current_data[rows])
-            self._row_idx += take
-            remaining -= take
-
-        tokens = np.concatenate(chunks, axis=0) if len(chunks) > 1 else chunks[0]
-        targets = torch.from_numpy(tokens.astype(np.int64))
-
-        # Reconstruct doc_ids from EOS positions
-        eos = (targets == self.eos_id)
-        shifted = torch.zeros_like(eos)
-        shifted[:, 1:] = eos[:, :-1]
-        doc_ids = shifted.cumsum(dim=1)
-
-        return targets, doc_ids
 
 
 # ============================================================================
@@ -306,31 +203,15 @@ def get_batch(split='train'):
     if split == 'train':
         if _train_loader is None:
             if config.data_dir:
-                if os.path.isdir(config.data_dir) and os.path.exists(
-                    os.path.join(config.data_dir, 'meta.json')
-                ):
-                    # Mode 1: local numpy shards (backward compat)
-                    _train_loader = _ShardedLoader(
-                        config.data_dir,
-                        rank=config.ddp_rank,
-                        world_size=config.ddp_world_size,
-                    )
-                    if config.master_process:
-                        m = _train_loader.meta
-                        print(f'[data] Sharded: {m["n_shards"]} shards, '
-                              f'{m["total_tokens"]/1e9:.1f}B tokens')
-                else:
-                    # Mode 2: HF Hub dataset (or local HF cache)
-                    _train_loader = _PreTokenizedPacker(
-                        config.data_dir,
-                        rank=config.ddp_rank,
-                        world_size=config.ddp_world_size,
-                    )
-                    if config.master_process:
-                        print(f'[data] Pre-tokenized: {_train_loader._n:,} docs '
-                              f'from {config.data_dir}')
+                _train_loader = _PreTokenizedPacker(
+                    config.data_dir,
+                    rank=config.ddp_rank,
+                    world_size=config.ddp_world_size,
+                )
+                if config.master_process:
+                    print(f'[data] Pre-tokenized: {_train_loader._n:,} docs '
+                          f'from {config.data_dir}')
             else:
-                # Mode 3: streaming + on-the-fly tokenization
                 _train_loader = _DocumentPacker(_make_train_iter)
                 if config.master_process:
                     print('[data] Streaming mode (no --data-dir)')
@@ -341,18 +222,15 @@ def get_batch(split='train'):
         _val_packer = _DocumentPacker(_make_val_iter)
         loader = _val_packer
 
-    # Build (targets, doc_ids) — vectorized for sharded, loop for streaming
-    if hasattr(loader, 'get_batch_tensors'):
-        targets, doc_ids = loader.get_batch_tensors(config.batch_size)
-    else:
-        all_ids = []
-        all_doc_ids = []
-        for _ in range(config.batch_size):
-            ids, dids = loader.get_sequence()
-            all_ids.append(ids)
-            all_doc_ids.append(dids)
-        targets = torch.tensor(all_ids, dtype=torch.long)       # (B, L)
-        doc_ids = torch.tensor(all_doc_ids, dtype=torch.long)    # (B, L)
+    # Build (targets, doc_ids) from packed sequences
+    all_ids = []
+    all_doc_ids = []
+    for _ in range(config.batch_size):
+        ids, dids = loader.get_sequence()
+        all_ids.append(ids)
+        all_doc_ids.append(dids)
+    targets = torch.tensor(all_ids, dtype=torch.long)       # (B, L)
+    doc_ids = torch.tensor(all_doc_ids, dtype=torch.long)    # (B, L)
 
     # Per-token positions (RoPE reset at doc boundaries)
     positions = _compute_positions(doc_ids)                       # (B, L)

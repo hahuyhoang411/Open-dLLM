@@ -28,7 +28,7 @@ from phase5.attention import (
     build_staircase_mask,
 )
 from phase5.checkpoint import load_checkpoint, save_checkpoint
-from phase5.data import _compute_positions, _DocumentPacker
+from phase5.data import _compute_positions, _DocumentPacker, _PreTokenizedPacker
 from phase5.generate import _add_gumbel_noise, generate
 from phase5.loss import compute_loss
 from phase5.model import Model
@@ -562,6 +562,112 @@ class TestData:
         for _ in range(5):
             _, doc_ids = packer.get_sequence()
             assert doc_ids[0] == 0, 'doc_ids should start from 0'
+
+    @staticmethod
+    def _make_local_packer(docs, tmp_dir):
+        """Create a _PreTokenizedPacker backed by a local Arrow dataset."""
+        from datasets import Dataset, Features, Sequence, Value
+        import numpy as np
+
+        features = Features({"input_ids": Sequence(Value("uint16"))})
+        ds = Dataset.from_dict({"input_ids": docs}, features=features)
+        ds_path = os.path.join(tmp_dir, "test_ds")
+        ds.save_to_disk(ds_path)
+
+        class LocalPacker(_PreTokenizedPacker):
+            def __init__(self, path, **kwargs):
+                from datasets import load_from_disk
+                ds_local = load_from_disk(path)
+                self._ds = ds_local
+                self._n = len(ds_local)
+                self._rng = np.random.RandomState(42)
+                self._eos_id = config.eos_token_id
+                self._buf = []
+                self._order = self._rng.permutation(self._n)
+                self._cursor = 0
+
+        return LocalPacker(ds_path)
+
+    def test_pretokenized_packer_basic(self):
+        """_PreTokenizedPacker produces sequences of exact seq_len."""
+        import numpy as np
+        import shutil
+
+        rng = np.random.RandomState(42)
+        docs = []
+        for _ in range(200):
+            length = rng.randint(50, 500)
+            ids = rng.randint(3, config.vocab_size, size=length).tolist() + [config.eos_token_id]
+            docs.append(ids)
+
+        tmp_dir = tempfile.mkdtemp()
+        packer = self._make_local_packer(docs, tmp_dir)
+
+        for _ in range(10):
+            ids, doc_ids = packer.get_sequence()
+            assert len(ids) == config.seq_len
+            assert len(doc_ids) == config.seq_len
+
+        shutil.rmtree(tmp_dir)
+
+    def test_pretokenized_packer_doc_ids(self):
+        """doc_ids start from 0 and increment at EOS boundaries."""
+        import shutil
+
+        docs = [[10, 20, 30, config.eos_token_id]] * 500
+        tmp_dir = tempfile.mkdtemp()
+        packer = self._make_local_packer(docs, tmp_dir)
+        ids, doc_ids = packer.get_sequence()
+
+        assert doc_ids[0] == 0
+        assert max(doc_ids) >= 1
+        for i in range(1, len(doc_ids)):
+            assert doc_ids[i] >= doc_ids[i - 1]
+        # EOS token gets same doc_id as preceding tokens, then increments
+        for i, tid in enumerate(ids):
+            if tid == config.eos_token_id and i + 1 < len(ids):
+                assert doc_ids[i + 1] == doc_ids[i] + 1
+
+        shutil.rmtree(tmp_dir)
+
+    def test_pretokenized_packer_epoch_boundary(self):
+        """Packer reshuffles when all docs consumed (epoch boundary)."""
+        import shutil
+
+        docs = [[i + 3, config.eos_token_id] for i in range(10)]
+        tmp_dir = tempfile.mkdtemp()
+        packer = self._make_local_packer(docs, tmp_dir)
+        # 10 docs × 2 tokens = 20 tokens per epoch
+        # seq_len=64 requires 4+ epochs to fill one sequence
+        ids, doc_ids = packer.get_sequence()
+        assert len(ids) == config.seq_len
+        unique_tokens = set(t for t in ids if t != config.eos_token_id)
+        assert len(unique_tokens) <= 10
+
+        shutil.rmtree(tmp_dir)
+
+    def test_pretokenized_packer_matches_document_packer(self):
+        """Both packers produce consistent doc_id semantics."""
+        import shutil
+
+        docs = [[100, 200, 300, config.eos_token_id]] * 500
+        tmp_dir = tempfile.mkdtemp()
+        packer = self._make_local_packer(docs, tmp_dir)
+        ids, doc_ids = packer.get_sequence()
+
+        assert doc_ids[0] == 0
+        for i in range(1, len(doc_ids)):
+            assert doc_ids[i] >= doc_ids[i - 1]
+
+        # Verify positions computed from doc_ids reset at boundaries
+        doc_ids_t = torch.tensor([doc_ids], dtype=torch.long)
+        pos = _compute_positions(doc_ids_t)
+        assert pos[0, 0].item() == 0
+        for i in range(1, len(doc_ids)):
+            if doc_ids[i] != doc_ids[i - 1]:
+                assert pos[0, i].item() == 0
+
+        shutil.rmtree(tmp_dir)
 
 
 # ============================================================================

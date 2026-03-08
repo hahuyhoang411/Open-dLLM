@@ -62,9 +62,7 @@ def pretokenize(hub_repo=HUB_REPO, num_proc=16, max_docs=None):
         desc="Tokenizing",
     )
 
-    total_tokens = sum(len(row["input_ids"]) for row in tokenized.iter(batch_size=10000))
-    print(f'Total tokens: {total_tokens:,} ({total_tokens/1e9:.2f}B)')
-
+    print(f'Tokenized {len(tokenized):,} documents')
     print(f'Pushing to Hub: {hub_repo}')
     tokenized.push_to_hub(hub_repo, max_shard_size="2GB")
 
