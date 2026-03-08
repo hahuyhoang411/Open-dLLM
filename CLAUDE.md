@@ -41,16 +41,17 @@
 - Phase 5 tokenizer: SmolLM2 cosmo2 merges + Qwen3 pre-tokenizer + 14 specials = 49,152 vocab
 - Phase 5 noise: LINEAR schedule (mask_prob=t, ELBO weight=1/t — trivially correct)
 - Phase 5 doc packing: no right-padding, attention masked at doc boundaries, RoPE resets per-doc
-- Phase 5 expected step-0 loss: ~10.8 (ln(49152)). If higher, check loss normalization and ELBO weighting
+- Phase 5 noise schedule: t ~ U[0.1, 1.0] (default `--t-min 0.1`), ELBO weight capped at 10. Per-block min-1-masked guarantee.
+- Phase 5 expected step-0 loss: ~19-20 (ELBO-weighted; raw CE ~9.6 < ln(49152)=10.80). Threshold is 25. Mask tokens produce higher CE at init due to SmolLM2's wider init std
 - Weights at `05_phase5_dllm/weights/phase5_dllm_b{block_size}.pt`
 
 ## Training Run Monitoring — MANDATORY
 When monitoring a training run (Modal, Kaggle, or any GPU), follow these rules. GPU time costs real money — a bad run left unchecked is money burned.
 
 ### Step-0 Sanity Check
-- Expected step-0 loss: ~10.8 (ln(49152) for Phase 5 vocab) or ~10.4 (ln(32768) for Phase 4). Acceptable range: 9–12.
-- If step-0 loss is >15: **STOP immediately.** Loss normalization or weighting is broken.
-- If step-0 loss is >30: **STOP immediately.** Something catastrophic (wrong labels, broken masking, CART explosion).
+- Phase 5 expected step-0 loss: ~19-20 (ELBO-weighted; raw CE ~9.6). Phase 4: ~10.4 (ln(32768)).
+- If step-0 loss is >25 (Phase 5) or >15 (Phase 4): **STOP immediately.** Loss normalization or weighting is broken.
+- If step-0 loss is >40: **STOP immediately.** Something catastrophic (wrong labels, broken masking, CART explosion).
 
 ### Loss Trajectory Red Flags — Act Within 2 Check-ins
 These patterns mean something is wrong. Do NOT "wait and see." Flag to user with diagnosis and recommend stopping:

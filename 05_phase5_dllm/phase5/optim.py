@@ -1,5 +1,4 @@
-"""
-Self-contained MuonClip optimizer with QK-Clip + AdamW fallback.
+"""Self-contained MuonClip optimizer with QK-Clip + AdamW fallback.
 
 No external dependencies — only stdlib (math, threading) + torch.
 Works in both single-GPU and DDP (no dist.all_gather dependency).
@@ -7,14 +6,16 @@ Works in both single-GPU and DDP (no dist.all_gather dependency).
 
 import math
 import threading
+
 import torch
-import torch.nn.functional as F
 from torch.optim import Optimizer
 
+from . import config
 
 # ============================================================================
 # Max Attention Logits Tracker (SDPA monkey-patch)
 # ============================================================================
+
 
 class _MaxLogitsTracker:
     """Track per-step max attention logit for QK-Clip.
@@ -28,10 +29,17 @@ class _MaxLogitsTracker:
     _tls = threading.local()
 
     @classmethod
-    def _update(cls, v: float):
-        cur = getattr(cls._tls, "max_logits", None)
-        if cur is None or v > cur:
+    def _update(cls, v):
+        """Accept 0-d GPU tensor or float. No .item() — stays on device."""
+        cur = getattr(cls._tls, 'max_logits', None)
+        if cur is None:
             cls._tls.max_logits = v
+        elif isinstance(cur, torch.Tensor) and isinstance(v, torch.Tensor):
+            cls._tls.max_logits = torch.maximum(cur, v)
+        else:
+            cur_f = cur.item() if isinstance(cur, torch.Tensor) else cur
+            v_f = v.item() if isinstance(v, torch.Tensor) else v
+            cls._tls.max_logits = max(cur_f, v_f)
 
     @classmethod
     def enable(cls):
@@ -39,10 +47,13 @@ class _MaxLogitsTracker:
 
     @classmethod
     def consume(cls):
-        """Return and reset the tracked max logit value."""
-        v = getattr(cls._tls, "max_logits", None)
+        """Return max logit as Python float (safe — called from optimizer.step(),
+        outside compiled graph). Resets tracker for next forward pass."""
+        v = getattr(cls._tls, 'max_logits', None)
         cls._tls.max_logits = None
-        return v
+        if v is None:
+            return None
+        return v.item() if isinstance(v, torch.Tensor) else v
 
 
 # ============================================================================
@@ -61,11 +72,11 @@ class MuonClip(Optimizer):
     """
 
     def __init__(self, params, **defaults):
-        defaults.setdefault("lr", 0.02)
-        defaults.setdefault("momentum", 0.95)
-        defaults.setdefault("weight_decay", 0.1)
-        defaults.setdefault("betas", (0.9, 0.95))
-        defaults.setdefault("eps", 1e-8)
+        defaults.setdefault('lr', 0.02)
+        defaults.setdefault('momentum', 0.95)
+        defaults.setdefault('weight_decay', 0.1)
+        defaults.setdefault('betas', (0.9, 0.95))
+        defaults.setdefault('eps', 1e-8)
         super().__init__(params, defaults)
         _MaxLogitsTracker.enable()
 
@@ -100,9 +111,9 @@ class MuonClip(Optimizer):
         max_logits = _MaxLogitsTracker.consume()
 
         for group in self.param_groups:
-            apply_muon = group.get("apply_muon", True)
-            lr = group["lr"]
-            wd = group["weight_decay"]
+            apply_muon = group.get('apply_muon', True)
+            lr = group['lr']
+            wd = group['weight_decay']
 
             if apply_muon:
                 self._muon_step(group, lr, wd, max_logits)
@@ -112,19 +123,19 @@ class MuonClip(Optimizer):
         return loss
 
     def _muon_step(self, group, lr, wd, max_logits):
-        momentum = group.get("momentum", 0.95)
-        is_qk = group.get("is_qk", False)
-        tau = group.get("qk_clip_tau", 100.0)
+        momentum = group.get('momentum', 0.95)
+        is_qk = group.get('is_qk', False)
+        tau = group.get('qk_clip_tau', 100.0)
 
-        for p in group["params"]:
-            if p.grad is None:
+        for p in group['params']:
+            if p.grad is None or p.ndim < 2:
                 continue
 
             state = self.state[p]
             if len(state) == 0:
-                state["momentum_buffer"] = torch.zeros_like(p)
+                state['momentum_buffer'] = torch.zeros_like(p)
 
-            buf = state["momentum_buffer"]
+            buf = state['momentum_buffer']
             buf.mul_(momentum).add_(p.grad)
 
             # Newton-Schulz orthogonalization + RMS scaling
@@ -146,25 +157,25 @@ class MuonClip(Optimizer):
             p.add_(update, alpha=-lr)
 
     def _adamw_step(self, group, lr, wd):
-        betas = group.get("betas", (0.9, 0.95))
-        eps = group.get("eps", 1e-8)
+        betas = group.get('betas', (0.9, 0.95))
+        eps = group.get('eps', 1e-8)
         beta1, beta2 = betas
 
-        for p in group["params"]:
+        for p in group['params']:
             if p.grad is None:
                 continue
 
             state = self.state[p]
             if len(state) == 0:
-                state["step"] = 0
-                state["exp_avg"] = torch.zeros_like(p)
-                state["exp_avg_sq"] = torch.zeros_like(p)
+                state['step'] = 0
+                state['exp_avg'] = torch.zeros_like(p)
+                state['exp_avg_sq'] = torch.zeros_like(p)
 
-            state["step"] += 1
-            t = state["step"]
+            state['step'] += 1
+            t = state['step']
 
-            exp_avg = state["exp_avg"]
-            exp_avg_sq = state["exp_avg_sq"]
+            exp_avg = state['exp_avg']
+            exp_avg_sq = state['exp_avg_sq']
 
             # Moment estimates
             exp_avg.mul_(beta1).add_(p.grad, alpha=1 - beta1)
@@ -190,7 +201,7 @@ class MuonClip(Optimizer):
 # ============================================================================
 
 def _is_qk_name(name: str) -> bool:
-    return ".c_q." in name or ".c_k." in name
+    return '.c_q.' in name or '.c_k.' in name
 
 
 def _dedup_params(model):
@@ -208,7 +219,7 @@ def build_param_groups(model):
 
     Returns a MuonClip optimizer instance.
     """
-    embed_names = {"token_emb.weight", "lm_head.weight"}
+    embed_names = {'token_emb.weight', 'lm_head.weight'}
 
     qk_muon, other_muon, adamw = [], [], []
 
@@ -226,19 +237,19 @@ def build_param_groups(model):
 
     if qk_muon:
         groups.append(dict(
-            params=qk_muon, lr=0.02, momentum=0.95, weight_decay=0.1,
+            params=qk_muon, lr=config.muon_lr, momentum=0.95, weight_decay=0.1,
             apply_muon=True, is_qk=True, qk_clip_tau=100.0,
         ))
 
     if other_muon:
         groups.append(dict(
-            params=other_muon, lr=0.02, momentum=0.95, weight_decay=0.1,
+            params=other_muon, lr=config.muon_lr, momentum=0.95, weight_decay=0.1,
             apply_muon=True, is_qk=False,
         ))
 
     if adamw:
         groups.append(dict(
-            params=adamw, lr=6e-4, betas=(0.9, 0.95), eps=1e-8,
+            params=adamw, lr=config.adamw_lr, betas=(0.9, 0.95), eps=1e-8,
             weight_decay=0.01, apply_muon=False,
         ))
 
@@ -246,7 +257,7 @@ def build_param_groups(model):
 
     # Store initial_lr for WSD schedule
     for pg in optimizer.param_groups:
-        pg["initial_lr"] = pg["lr"]
+        pg['initial_lr'] = pg['lr']
 
     return optimizer
 
@@ -269,9 +280,9 @@ def build_adamw_optimizer(model):
         dict(params=no_decay, weight_decay=0.0),
     ]
 
-    optimizer = torch.optim.AdamW(groups, lr=6e-4, betas=(0.9, 0.95), eps=1e-8)
+    optimizer = torch.optim.AdamW(groups, lr=config.adamw_lr, betas=(0.9, 0.95), eps=1e-8)
 
     for pg in optimizer.param_groups:
-        pg["initial_lr"] = pg["lr"]
+        pg['initial_lr'] = pg['lr']
 
     return optimizer

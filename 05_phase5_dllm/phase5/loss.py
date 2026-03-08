@@ -1,15 +1,29 @@
-"""Loss computation for Phase 5 block diffusion LM."""
+"""Loss computation for Phase 5 block diffusion LM.
+
+Uses chunked CE with gradient checkpointing to avoid materializing the full
+(B*L, vocab) logits tensor (~24 GB at batch=64, vocab=49152).
+
+Note: Liger FLCE reduction='none' backward is broken (linkedin/Liger-Kernel#488).
+Forward produces correct loss values but backward returns zero gradients.
+"""
 
 import torch
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as grad_checkpoint
 
 from . import config
 
-try:
-    from liger_kernel.ops.fused_linear_cross_entropy import LigerFusedLinearCrossEntropyFunction
-    _LIGER_FLCE_AVAILABLE = True
-except ImportError:
-    _LIGER_FLCE_AVAILABLE = False
+_CHUNK_SIZE = 16384  # tokens per chunk — peak ~1.5 GB bf16 for vocab=49152
+# 16384 = 4x fewer chunks than 4096 → fewer kernel launches + Python overhead
+# Each chunk: (16384, 49152) logits = 1.5 GB bf16, well within GPU headroom
+# Recomputed during backward via grad_checkpoint (no persistent VRAM cost)
+
+
+def _chunk_ce(h_chunk, weight, t_chunk, w_chunk):
+    """Weighted CE for one token chunk. Re-executed during backward via grad_checkpoint."""
+    logits = h_chunk @ weight.T  # (chunk, vocab)
+    ce = F.cross_entropy(logits, t_chunk, reduction='none')  # (chunk,)
+    return (ce * w_chunk).sum()
 
 
 def compute_loss(hidden_states, targets, mask, elbo_weight, lm_head_weight, use_liger=False):
@@ -17,34 +31,23 @@ def compute_loss(hidden_states, targets, mask, elbo_weight, lm_head_weight, use_
 
     Normalizes by ALL real tokens (not just masked). The 1/t ELBO weight already
     accounts for the masking fraction. Ref: ZHZisZZ/dllm, Phase 4 fix [P4-19].
-
-    Expected step-0 loss: ln(49152) ~ 10.80.
     """
     B, L, D = hidden_states.shape
+    h_flat = hidden_states.contiguous().view(-1, D)
+    t_flat = targets.contiguous().view(-1)
+    w_flat = (mask.float() * elbo_weight).contiguous().view(-1)
 
-    if use_liger and _LIGER_FLCE_AVAILABLE:
-        liger_out = LigerFusedLinearCrossEntropyFunction.apply(
-            hidden_states.contiguous().view(-1, D),   # (B*L, D)
-            lm_head_weight,                            # (vocab, D)
-            targets.contiguous().view(-1),             # (B*L,)
-            None,                                      # bias
-            None,                                      # ce_weight
-            -100,                                      # ignore_index
-            0.0,                                       # lse_square_scale
-            0.0,                                       # label_smoothing
-            "none",                                    # reduction
+    N = h_flat.shape[0]
+    losses = []
+    for i in range(0, N, _CHUNK_SIZE):
+        j = min(i + _CHUNK_SIZE, N)
+        chunk_loss = grad_checkpoint(
+            _chunk_ce,
+            h_flat[i:j], lm_head_weight, t_flat[i:j], w_flat[i:j],
+            use_reentrant=False,
         )
-        per_token_loss = (liger_out[0] if isinstance(liger_out, tuple) else liger_out).view(B, L)
-    else:
-        logits = hidden_states @ lm_head_weight.T      # (B, L, vocab)
-        per_token_loss = F.cross_entropy(
-            logits.transpose(1, 2), targets, reduction="none"
-        )  # (B, L)
+        losses.append(chunk_loss)
 
-    # Weight: per-token CE * mask indicator * ELBO weight
-    weighted = per_token_loss * mask.float() * elbo_weight
-
-    # Normalize by all real tokens (with doc packing, all are real;
-    # pad check for safety/generality)
+    total_loss = torch.stack(losses).sum()
     real_count = (targets != config.pad_token_id).float().sum().clamp(min=1)
-    return weighted.sum() / real_count
+    return total_loss / real_count

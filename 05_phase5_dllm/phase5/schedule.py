@@ -9,14 +9,29 @@ _cart_kernel_cache = {}
 
 
 def sample_timesteps(batch_size, num_blocks, block_size, t_min=config.t_min):
-    """Sample per-block t ~ U[t_min, 1], expand to per-token."""
-    t_blocks = t_min + (1 - t_min) * torch.rand(batch_size, num_blocks)  # (B, num_blocks)
+    """Sample per-block t ~ U[t_min, 1), expand to per-token.
+
+    Uses antithetic (stratified) sampling across batch*blocks for
+    variance reduction. Ref: bd3lms/diffusion.py:776-780.
+    """
+    eps = torch.rand(batch_size, num_blocks)
+    # Antithetic sampling: stratify across batch*blocks
+    total = batch_size * num_blocks
+    offset = torch.arange(total).view(batch_size, num_blocks).float() / total
+    eps = (eps / total + offset) % 1
+    t_blocks = t_min + (1 - t_min) * eps                                 # (B, num_blocks)
     t = t_blocks.repeat_interleave(block_size, dim=1)                    # (B, L)
     return t_blocks, t
 
 
-def apply_noise(targets, t, mask_token_id=config.mask_token_id, pad_token_id=None):
-    """LINEAR schedule: mask_prob = t. Apply noise mask to targets."""
+def apply_noise(targets, t, mask_token_id=config.mask_token_id, pad_token_id=None,
+                block_size=config.block_size):
+    """LINEAR schedule: mask_prob = t. Apply noise mask to targets.
+
+    Per-block min-1-masked guarantee (Stable-DiffCoder): every block of
+    block_size tokens has at least one masked real token, eliminating wasted
+    supervision. At t=0.05, B=32: P(zero masks per block) = 0.95^32 = 19%.
+    """
     B, L = targets.shape
     mask_prob = t  # linear schedule: trivially mask_prob = t
 
@@ -27,17 +42,20 @@ def apply_noise(targets, t, mask_token_id=config.mask_token_id, pad_token_id=Non
         padding = targets != pad_token_id
         noise_mask = noise_mask & padding
 
-    # Min-1-masked guarantee per sequence
-    zero_masked = noise_mask.sum(dim=1) == 0
-    if zero_masked.any():
-        for idx in zero_masked.nonzero(as_tuple=True)[0]:
+    # Per-block min-1-masked guarantee (replaces per-sequence check)
+    num_blocks = L // block_size
+    mask_blocks = noise_mask.view(B, num_blocks, block_size)
+    zero_blocks = mask_blocks.sum(dim=2) == 0  # (B, num_blocks)
+    if zero_blocks.any():
+        for b_idx, blk_idx in zip(*zero_blocks.nonzero(as_tuple=True)):
+            start = blk_idx * block_size
             if pad_token_id is not None:
-                real_pos = (targets[idx] != pad_token_id).nonzero(as_tuple=True)[0]
+                real_pos = (targets[b_idx, start:start + block_size] != pad_token_id).nonzero(as_tuple=True)[0]
             else:
-                real_pos = torch.arange(L, device=targets.device)
+                real_pos = torch.arange(block_size, device=targets.device)
             if len(real_pos) > 0:
-                pick = real_pos[torch.randint(len(real_pos), (1,))]
-                noise_mask[idx, pick] = True
+                pick = start + real_pos[torch.randint(len(real_pos), (1,))]
+                noise_mask[b_idx, pick] = True
 
     x_noisy = targets.clone()
     x_noisy[noise_mask] = mask_token_id
@@ -83,6 +101,8 @@ def compute_cart_weights(mask, padding, p=config.cart_p):
     ctx = F.pad(context.float().unsqueeze(1), (max_dist, max_dist))
     cart_scores = F.conv1d(ctx, kernel).squeeze(1)  # (B, L)
 
-    # Only masked positions get CART weight; unmasked get 0 (matching Dream)
+    # Raw scores: more context → higher weight (Dream 7B semantics).
+    # Tokens with more unmasked neighbors get stronger gradient signal.
+    # Unmasked positions get 0.
     cart_scores = cart_scores * mask.float()
     return cart_scores

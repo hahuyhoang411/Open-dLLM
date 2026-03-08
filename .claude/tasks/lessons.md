@@ -11,14 +11,23 @@
 - IDs are stable: [MASK]=0, <|endoftext|>=1, <|padding|>=2
 - Retraining with more special tokens shifts BPE merge IDs (from 1→ to 3→), so old weights are incompatible
 
-## Liger Kernel API (Phase 4)
+## Liger FLCE — BROKEN with reduction='none' (Phase 5 — CRITICAL)
+- **Liger FLCE backward does NOT support `reduction='none'`** (linkedin/Liger-Kernel#488, Dec 2024)
+- Forward produces correct per-token loss values, but backward returns ZERO gradients for ALL parameters
+- Symptom: loss is correct (~19 at step 0), `grad_norm=0.000000` every step, model never learns
+- Loss barely changes because "learning" is just weight decay (optimizer steps with zero gradients)
+- The autograd graph IS connected (loss.requires_grad=True, grad_fn=DivBackward0) — misleading
+- **Fix**: Chunked CE with gradient checkpointing — process 4096 tokens at a time, recompute logits during backward
+- Memory: ~1.5 GB peak (one chunk) vs 24 GB full logits. Speed: ~15ms overhead (acceptable)
+- Pattern: NEVER use Liger FLCE with `reduction='none'`. If you need per-token loss, use chunked CE.
+- Liger RMSNorm + SwiGLU still work fine — only FLCE is affected
+
+## Liger Kernel API (Phase 4 — reference only, DO NOT USE FLCE)
 - LigerFusedLinearCrossEntropyFunction.apply arg order: _input, weight, target, bias, ce_weight, ignore_index, lse_square_scale, label_smoothing, reduction
 - **Return value is a 4-TUPLE**: `(loss, z_loss, token_accuracy, predicted_tokens)` — NOT a single tensor!
-- Must unpack: `per_token_loss, _, _, _ = LigerFusedLinearCrossEntropyFunction.apply(...)`
 - ce_weight must be None (not 0.0) — it expects a Tensor or None, not a float
 - lse_square_scale=0.0 to disable z-loss (not -1; negative values corrupt gradients catastrophically)
 - ignore_index=-100 is the standard PyTorch default (not -1)
-- Always verify arg order against Liger source: github.com/linkedin/Liger-Kernel/blob/main/src/liger_kernel/ops/fused_linear_cross_entropy.py
 
 ## Gradient Checkpointing Independence
 - grad_checkpoint should be gated on `self.training` only, NOT on `use_amp`
@@ -123,9 +132,74 @@
 ## Phase 5 Code Review Bugs Found
 - Missing `@torch.no_grad()` on `estimate_loss` → VRAM leak building computation graphs during eval
 - Uninitialized `losses` dict → NameError when resuming from checkpoint not aligned to eval_interval
-- Fallback attention mask (non-FlexAttention) doesn't enforce doc boundaries — only affects CPU/MPS testing
-- CART weight direction was inverted vs Dream reference — FIXED: now matches Dream (more context = higher weight)
 - Missing `set_cache_mode()` in model.py → `disable_kv_cache()` destroyed cache during generation — FIXED
 - Named checkpoint not atomic (no tmp+replace) — FIXED
 - `model.train()` not restored on exception in generate.py — FIXED: moved to finally block
 - Dead SDPA monkey-patch in `_MaxLogitsTracker.enable()` — FIXED: replaced with pass
+- RMSNorm eps not set → LigerRMSNorm used 1e-6, nn.RMSNorm bfloat16 fallback used 7.8e-3 (SmolLM2 spec: 1e-5) — FIXED
+- Doc packing truncated long docs to seq_len-1 (defeating entire purpose of packing) — FIXED: removed truncation
+- CART weights: Dream uses RAW scores (more context = higher weight, NOT inverted). Phase 4's `1/score` was the bug. Raw scores are correct. Scale differs from ELBO (0.1-0.3 vs 1-1000) but Dream normalizes by masked count, LR compensates.
+- Dense fallback `build_staircase_mask` ignored doc boundaries — FIXED: added doc_ids parameter
+- MuonClip `_muon_step` had no `p.ndim < 2` guard (latent crash) — FIXED
+- Silent QK-Clip disable when `_MaxLogitsTracker` import fails (try/except swallowed) — FIXED: added warning
+- `apply_noise` called without `pad_token_id` so padding guard never fired — FIXED: pass config.pad_token_id
+- `latest.pt` checkpoint double-serialized full model (288MB×2) — FIXED: use shutil.copy2 from named
+- Step-0 loss sanity check: Phase 5 threshold is >25 (ELBO-weighted loss ~19-20 at init due to SmolLM2 wider init + mask token CE asymmetry; raw CE ~9.6 is correct)
+- Pattern: always pass eps= explicitly to norm layers. Default varies by implementation (Liger 1e-6, nn.RMSNorm dtype-dependent)
+- Pattern: document packing must NOT truncate long docs — the buffer carries overflow to next sequence
+
+## CART is Wrong for From-Scratch Pretraining (Phase 5)
+- CART (Context-Adaptive Reweighting) replaces ELBO 1/t weight with a spatial heuristic — breaks the variational bound
+- At t=0.99: CART weight=0.01, ELBO weight=1.01 → 100x gradient starvation at high noise
+- Generation starts at ~100% masked → the model never learns to denoise from scratch
+- Loss=1.1 looks good but is an illusion: CART weights are 5-10x smaller, so loss number is 5-10x smaller
+- Dream 7B uses CART for **SFT on pretrained Qwen2.5**, NOT from-scratch pretraining
+- Dream's default `time_reweighting` is `"original"` (= 1/t), not CART
+- Fix: CART is opt-in (`--cart`), off by default. Only enable for SFT stage.
+- Pattern: always check if a technique's source paper used it for pretraining vs fine-tuning
+
+## Whole-Model Compile Crashes with Grad Checkpoint + FlexAttention (Phase 5)
+- `torch.compile(model)` + `grad_checkpoint()` inside Block.forward() + FlexAttention = `cudaErrorIllegalAddress` (XID 31 MMU fault)
+- Root cause: compile traces through checkpoint calls; combining with FlexAttention (higher-order op) inside same graph crashes
+- Nanochat/modded-nanogpt use whole-model compile but do NOT use gradient checkpointing
+- Fix: per-block compile (torchtitan pattern) — checkpoint wrapper stays OUTSIDE compiled boundary
+- `for i, block in enumerate(model.blocks): model.blocks[i] = torch.compile(block, dynamic=False)`
+- DO NOT switch to whole-model compile unless gradient checkpointing is also removed
+- Documented in `memory/torch-compile-grad-ckpt.md`
+
+## Training Throughput Measurement (Phase 5)
+- Cumulative average tok/s includes torch.compile warm-up (5-15 min) → reports 2-3x lower than steady-state
+- Fix: per-step timing with `torch.cuda.synchronize()` at both ends, skip first 10 steps from average
+- Nanochat pattern: `tok_per_sec = total_batch_size / dt` per step, separate running average
+- Also: our model processes 4096-length seqs (`[x_t||x_0]`) but "real" tokens are 2048 → apparent tok/s is half vs AR
+
+## Gumbel-Max Sampling Bug (Phase 5)
+- `_add_gumbel_noise(logits, temperature)` must compute `logits.exp() / gumbel_noise`, NOT `logits / gumbel_noise`
+- Without `.exp()`, the function divides log-space values by noise — no theoretical basis, produces garbage tokens
+- Bug is masked at temperature=0 (greedy) since the function returns logits unchanged
+- Ref: `refs/dllm/dllm/core/samplers/utils.py:83` — `return logits.exp() / gumbel_noise`
+- Pattern: when implementing sampling tricks from papers, always verify against reference code line-by-line
+
+## Phase 5 Training Improvements (from 11-paper landscape analysis, 2026-03-08)
+See `docs/research/papers/2026-03-08-dllm-training-landscape.md`.
+
+### 1. Per-block min-1-masked guarantee — DONE
+- `schedule.py:apply_noise()` now checks per-block, not per-sequence
+- Reshapes mask to (B, num_blocks, block_size), force-masks one random real token in any empty block
+- Source: Stable-DiffCoder (2601.15892)
+
+### 2. Raise t_min to 0.1 — DONE
+- `config.py:t_min = args.t_min` (default 0.1, CLI `--t-min`)
+- Caps ELBO weight at 10 (was 1000 at t_min=0.001)
+- Conservative choice (BD3-LMs suggests 0.3 for B=16, but our B=32 is different geometry)
+- Source: BD3-LMs, Implicit Regularizer, Quokka
+
+### 3. Upper-clip t_max to ~0.9 — REJECTED
+- ELBO weight at t=0.95 is just 1.05 — no gradient explosion at top end
+- Creates train-test mismatch: generation starts from ~100% masked but model never sees that during training
+- The "noise regime" is necessary for regularization (Implicit Regularizer proved both regimes needed)
+
+### 4. Data budget — addressed via multi-epoch
+- Quokka: DLMs need ~5x more data than AR at 144M. Multi-epoch training is the pragmatic answer.
+- DLMs tolerate 1000+ epochs at 144M (masking diversity = implicit augmentation)
+- Source: Quokka (2510.03280), Ni et al. (2511.03276)

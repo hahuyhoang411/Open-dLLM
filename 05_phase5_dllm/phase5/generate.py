@@ -1,16 +1,31 @@
-"""Block-by-block generation with KV cache and confidence-based unmasking."""
+"""Block-by-block generation with KV cache and confidence-based unmasking.
+
+Sampling uses Gumbel-max (ref: dllm/core/samplers/utils.py:add_gumbel_noise).
+Confidence = argmax token probability (ref: dllm/core/samplers/bd3lm.py:108).
+"""
 
 import time
+
 import torch
 import torch.nn.functional as F
 
-from .config import mask_token_id, eos_token_id, pad_token_id, device, block_size
+from .config import block_size, device, eos_token_id, mask_token_id, pad_token_id
+
+
+def _add_gumbel_noise(logits, temperature):
+    """Gumbel-max sampling. Ref: dllm/core/samplers/utils.py:72-83."""
+    if temperature == 0:
+        return logits
+    logits = logits.to(torch.float64)
+    noise = torch.rand_like(logits, dtype=torch.float64)
+    gumbel_noise = (-torch.log(noise.clamp(min=1e-20))) ** temperature
+    return logits.exp() / gumbel_noise
 
 
 @torch.no_grad()
-def generate(model, encode_fn, decode_fn, prompt="", max_new_tokens=512,
+def generate(model, encode_fn, decode_fn, prompt='', max_new_tokens=512,
              denoise_steps=10, temperature=0.7, top_k=50,
-             confidence_threshold=0.9):
+             confidence_threshold=0.5):
     was_training = model.training
     model.eval()
     model.reset_kv_cache()
@@ -62,6 +77,10 @@ def generate(model, encode_fn, decode_fn, prompt="", max_new_tokens=512,
             masked = torch.zeros(1, block_size, dtype=torch.bool, device=device)
             masked[0, fill_from_prompt:] = True
 
+            # Precompute how many tokens to unmask per step (uniform schedule)
+            n_masked = masked.sum().item()
+            tokens_per_step = max(1, n_masked // denoise_steps)
+
             # Denoise loop: iteratively unmask within this block
             for step in range(denoise_steps):
                 if not masked.any():
@@ -69,36 +88,42 @@ def generate(model, encode_fn, decode_fn, prompt="", max_new_tokens=512,
                 total_steps += 1
 
                 logits, _ = model(block, pos_offset=pos_offset)
-                probs = F.softmax(logits / temperature, dim=-1)
 
-                # Never generate mask or padding tokens
-                probs[:, :, mask_token_id] = 0.0
-                probs[:, :, pad_token_id] = 0.0
+                # Suppress mask/padding tokens
+                logits[:, :, mask_token_id] = -float('inf')
+                logits[:, :, pad_token_id] = -float('inf')
 
-                # Top-k confidence-based unmasking
-                top_k_probs, top_k_indices = torch.topk(probs, k=top_k, dim=-1)
-                confidences = top_k_probs.sum(dim=-1)
+                # Gumbel-max sampling (ref: dllm samplers)
+                noisy_logits = _add_gumbel_noise(logits, temperature)
+                x0 = torch.argmax(noisy_logits, dim=-1)  # (1, block_size)
 
-                decode_mask = (confidences >= confidence_threshold) & masked
+                # Per-token confidence = probability of predicted token
+                # Ref: dllm/core/samplers/bd3lm.py:108
+                probs = F.softmax(logits.float(), dim=-1)
+                confidences = torch.gather(
+                    probs, -1, x0.unsqueeze(-1)
+                ).squeeze(-1)  # (1, block_size)
 
-                # If nothing qualifies, force-unmask most confident masked position
-                if not decode_mask.any():
-                    masked_confidences = torch.where(
-                        masked, confidences,
-                        torch.tensor(-float("inf"), device=device),
-                    )
-                    decode_mask.view(-1)[masked_confidences.argmax()] = True
+                # Determine which positions to unmask this step
+                masked_confidences = torch.where(
+                    masked, confidences,
+                    torch.tensor(-float('inf'), device=device),
+                )
 
-                # Sample from normalized top-k distribution
-                top_k_probs_norm = top_k_probs / top_k_probs.sum(dim=-1, keepdim=True)
-                sampled_k = torch.multinomial(
-                    top_k_probs_norm.view(-1, top_k), 1
-                ).view(1, block_size)
-                sampled_tokens = torch.gather(
-                    top_k_indices, -1, sampled_k.unsqueeze(-1)
-                ).squeeze(-1)
+                # Unmask top-k most confident masked positions
+                n_to_unmask = min(tokens_per_step, int(masked.sum().item()))
+                if step == denoise_steps - 1:
+                    n_to_unmask = int(masked.sum().item())
+                n_to_unmask = max(1, n_to_unmask)
 
-                block = torch.where(decode_mask, sampled_tokens, block)
+                _, top_indices = torch.topk(
+                    masked_confidences.view(-1), k=n_to_unmask
+                )
+                decode_mask = torch.zeros_like(masked.view(-1))
+                decode_mask[top_indices] = True
+                decode_mask = decode_mask.view(1, block_size).bool()
+
+                block = torch.where(decode_mask, x0, block)
                 masked = masked & ~decode_mask
 
             # Cache the finalized block
@@ -124,14 +149,17 @@ def generate(model, encode_fn, decode_fn, prompt="", max_new_tokens=512,
             tokens_generated += len(new_tokens)
 
         elapsed = time.time() - t_start
-        tok_per_sec = tokens_generated / elapsed if elapsed > 0 else float("inf")
-        print(f"Generation: {total_steps} denoise steps, {tokens_generated} tokens, "
-              f"{tok_per_sec:.1f} tok/s")
+        tok_per_sec = tokens_generated / elapsed if elapsed > 0 else float('inf')
+        print(f'Generation: {total_steps} denoise steps, {tokens_generated} tokens, '
+              f'{tok_per_sec:.1f} tok/s')
 
-        return decode_fn(all_tokens)
+        # Filter special tokens before decoding
+        decoded_tokens = [t for t in all_tokens if t >= 14]  # skip special IDs 0-13
+        return decode_fn(decoded_tokens)
 
     finally:
-        # CRITICAL: reset KV cache so stale batch=1 state doesn't crash training
+        # Reset cache_mode AND KV cache so stale state doesn't corrupt training
+        model.set_cache_mode(False)
         model.reset_kv_cache()
         if was_training:
             model.train()

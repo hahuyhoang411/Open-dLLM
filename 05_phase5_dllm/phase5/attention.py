@@ -1,22 +1,28 @@
-"""
-Attention module: RoPE, staircase masks, Multi-Head Attention with GQA + Gated Query.
-"""
+"""Attention module: RoPE, staircase masks, Multi-Head Attention with GQA + Gated Query."""
 
 import math
 
 import torch
-import torch.nn as nn
+from torch import nn
 from torch.nn import functional as F
 
 from .config import (
-    n_embd, n_head, n_kv_head, head_dim, seq_len, block_size,
-    use_flex, use_liger,
-    _compiled_flex, _FLEX_AVAILABLE, BlockMask, create_block_mask,
+    _FLEX_AVAILABLE,
+    BlockMask,
+    _compiled_flex,
+    create_block_mask,
+    head_dim,
+    n_embd,
+    n_head,
+    n_kv_head,
+    use_flex,
 )
 
 try:
     from .optim import _MaxLogitsTracker
 except ImportError:
+    import warnings
+    warnings.warn('_MaxLogitsTracker import failed — QK-Clip disabled', RuntimeWarning, stacklevel=2)
     _MaxLogitsTracker = None
 
 
@@ -44,11 +50,19 @@ def apply_rotary_emb(q, k, cos, sin):
 #   M_OBC (offset block-causal): x_t attends to x_0 from STRICTLY EARLIER blocks
 #   M_BC  (block-causal): x_0 attends to x_0 causally (current + earlier)
 
-def build_staircase_mask(seq_len, blk_size):
+def build_staircase_mask(seq_len, blk_size, doc_ids=None):
+    """Dense staircase mask. If doc_ids provided, enforces doc boundaries per batch row.
+
+    Args:
+        seq_len: L (real token count). Mask is (2L, 2L) or (B, 2L, 2L).
+        blk_size: diffusion block size.
+        doc_ids: (B, L) int tensor. If given, returns (B, 1, 2L, 2L) for broadcast over heads.
+    """
     n = seq_len
     total = 2 * n
 
-    pos = torch.arange(total)
+    _device = doc_ids.device if doc_ids is not None else None
+    pos = torch.arange(total, device=_device)
     q = pos.unsqueeze(1)
     kv = pos.unsqueeze(0)
 
@@ -65,7 +79,17 @@ def build_staircase_mask(seq_len, blk_size):
     # M_BC: x_0 queries attend to x_0 keys from current or earlier blocks
     m_bc = (block_q >= block_kv) & x0_flag_kv & x0_flag_q
 
-    allow = m_bd | m_obc | m_bc
+    allow = m_bd | m_obc | m_bc  # (2L, 2L)
+
+    if doc_ids is not None:
+        # Enforce doc boundaries: both halves use same doc_ids
+        # doc_ids: (B, L) -> expand to (B, 2L) positions via % n indexing
+        d_q = doc_ids[:, pos.unsqueeze(1) % n]   # (B, 2L, 1) via broadcast
+        d_kv = doc_ids[:, pos.unsqueeze(0) % n]  # (B, 1, 2L)
+        same_doc = (d_q == d_kv)                  # (B, 2L, 2L)
+        allow = allow.unsqueeze(0) & same_doc     # (B, 2L, 2L)
+        return torch.where(allow, 0.0, float('-inf')).unsqueeze(1)  # (B, 1, 2L, 2L)
+
     return torch.where(allow, 0.0, float('-inf'))
 
 
@@ -81,7 +105,7 @@ def build_staircase_block_mask(seq_len, blk_size, doc_ids=None):
 
     if doc_ids is not None:
         # doc_ids lives on CUDA for the mask_mod closure
-        _doc_ids = doc_ids.to("cuda")
+        _doc_ids = doc_ids.to('cuda')
 
         def staircase_mask_mod(b, h, q_idx, kv_idx):
             x0_q = (q_idx >= n)
@@ -102,26 +126,26 @@ def build_staircase_block_mask(seq_len, blk_size, doc_ids=None):
             staircase_mask_mod,
             B=B, H=None,
             Q_LEN=2 * n, KV_LEN=2 * n,
-            device="cuda",
+            device='cuda',
         )
-    else:
-        def staircase_mask_mod(b, h, q_idx, kv_idx):
-            x0_q = (q_idx >= n)
-            x0_kv = (kv_idx >= n)
-            blk_q = (q_idx % n) // blk_size
-            blk_kv = (kv_idx % n) // blk_size
 
-            m_bd = (blk_q == blk_kv) & (x0_q == x0_kv)
-            m_obc = (blk_q > blk_kv) & x0_kv & ~x0_q
-            m_bc = (blk_q >= blk_kv) & x0_kv & x0_q
-            return m_bd | m_obc | m_bc
+    def staircase_mask_mod(b, h, q_idx, kv_idx):
+        x0_q = (q_idx >= n)
+        x0_kv = (kv_idx >= n)
+        blk_q = (q_idx % n) // blk_size
+        blk_kv = (kv_idx % n) // blk_size
 
-        return create_block_mask(
-            staircase_mask_mod,
-            B=None, H=None,
-            Q_LEN=2 * n, KV_LEN=2 * n,
-            device="cuda",
-        )
+        m_bd = (blk_q == blk_kv) & (x0_q == x0_kv)
+        m_obc = (blk_q > blk_kv) & x0_kv & ~x0_q
+        m_bc = (blk_q >= blk_kv) & x0_kv & x0_q
+        return m_bd | m_obc | m_bc
+
+    return create_block_mask(
+        staircase_mask_mod,
+        B=None, H=None,
+        Q_LEN=2 * n, KV_LEN=2 * n,
+        device='cuda',
+    )
 
 
 def _visualize_mask(mask, seq_len, blk_size):
@@ -131,34 +155,34 @@ def _visualize_mask(mask, seq_len, blk_size):
 
     num_blocks = (n + blk_size - 1) // blk_size
 
-    halves = ["x_t", "x_0"]
-    header_half = "         "
-    header_blk = "         "
+    halves = ['x_t', 'x_0']
+    header_half = '         '
+    header_blk = '         '
     for half in halves:
         span = n
         pad = span // 2 - len(half) // 2
-        header_half += " " * pad + half + " " * (span - pad - len(half))
+        header_half += ' ' * pad + half + ' ' * (span - pad - len(half))
     print(header_half)
 
     for half in halves:
         for b in range(num_blocks):
-            label = f"b{b}"
+            label = f'b{b}'
             blen = min(blk_size, n - b * blk_size)
             pad = blen // 2 - len(label) // 2
-            header_blk += " " * pad + label + " " * (blen - pad - len(label))
+            header_blk += ' ' * pad + label + ' ' * (blen - pad - len(label))
     print(header_blk)
 
     for r in range(total):
-        half = "x_t" if r < n else "x_0"
+        half = 'x_t' if r < n else 'x_0'
         b_idx = (r % n) // blk_size
         pos_in_blk = (r % n) % blk_size
         if pos_in_blk == 0:
-            label = f"{half} b{b_idx}: "
+            label = f'{half} b{b_idx}: '
         else:
-            label = "         "
-        row_chars = ""
+            label = '         '
+        row_chars = ''
         for c in range(total):
-            row_chars += "." if mask[r, c] == 0.0 else "X"
+            row_chars += '.' if mask[r, c] == 0.0 else 'X'
         print(label + row_chars)
 
 
@@ -229,13 +253,13 @@ class MultiHeadAttention(nn.Module):
             q = _apply_rotary_emb(q, cos_pos, sin_pos)
             k = _apply_rotary_emb(k, cos_pos[:, :, :1, :].expand(-1, -1, n_kv_head, -1),
                                   sin_pos[:, :, :1, :].expand(-1, -1, n_kv_head, -1))
-        elif T == cos.size(1):
+        elif cos.size(1) == T:
             # Inference or single-half: positions 0..T-1
             q, k = apply_rotary_emb(q, k, cos, sin)
         else:
             # Training [x_t || x_0]: both halves share positions 0..L-1
             L = cos.size(1)
-            assert T == 2 * L, f"Expected T={T} == 2*L={2*L}"
+            assert T == 2 * L, f'Expected T={T} == 2*L={2 * L}'
             q_t, q_0 = q[:, :L], q[:, L:]
             k_t, k_0 = k[:, :L], k[:, L:]
             q_t, k_t = apply_rotary_emb(q_t, k_t, cos, sin)
@@ -247,13 +271,17 @@ class MultiHeadAttention(nn.Module):
         q, k = self.q_norm(q), self.k_norm(k)
 
         # Track attention logit upper bound for QK-Clip
-        # (works with any attention backend, including FlexAttention)
+        # Keep as 0-d GPU tensor — no .item() here (causes graph breaks + recompilation
+        # inside torch.compile + grad_checkpoint, leading to CUDA illegal memory access).
+        # .item() deferred to _MaxLogitsTracker.consume() in optimizer.step().
         if self.training and _MaxLogitsTracker is not None:
-            _MaxLogitsTracker._update(
-                q.detach().float().norm(p=2, dim=-1).max().item()
-                * k.detach().float().norm(p=2, dim=-1).max().item()
-                / math.sqrt(head_dim)
-            )
+            with torch.no_grad():
+                logit_bound = (
+                    q.float().norm(p=2, dim=-1).max()
+                    * k.float().norm(p=2, dim=-1).max()
+                    / math.sqrt(head_dim)
+                )
+            _MaxLogitsTracker._update(logit_bound)
 
         # Transpose to (B, H, T, D)
         q = q.transpose(1, 2)

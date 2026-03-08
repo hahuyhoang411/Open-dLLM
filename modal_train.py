@@ -18,8 +18,15 @@ Usage:
     # Check training status
     modal run modal_train.py::status
 
-    # Download latest checkpoint
-    modal volume get dllm-checkpoints latest.pt ./latest.pt
+    # Resume a specific run
+    modal run modal_train.py --run-id 20260307_212400
+
+    # Download checkpoint from a run
+    modal volume get dllm-checkpoints phase5/20260307_212400/latest.pt ./latest.pt
+
+    # Pre-tokenize dataset (run BEFORE training for best throughput)
+    modal run modal_train.py::pretokenize
+    modal run modal_train.py::pretokenize --max-tokens 20000000000
 """
 
 import modal
@@ -56,6 +63,7 @@ class Train:
         self,
         trackio_space: str = "",
         extra_args: str = "",
+        run_id: str = "",
     ):
         import os
         import subprocess
@@ -64,6 +72,8 @@ class Train:
         os.environ["HF_HOME"] = "/data"
         os.environ["HF_DATASETS_CACHE"] = "/data/datasets"
         os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+        ckpt_dir = f"/checkpoints/phase5/{run_id}" if run_id else "/checkpoints/phase5"
 
         n_gpus = torch.cuda.device_count()
         launcher = (
@@ -75,9 +85,14 @@ class Train:
         cmd = [
             *launcher,
             "/root/05_phase5_dllm/train.py", "--train",
-            "--ckpt-dir=/checkpoints",
-            "--resume=/checkpoints",
+            f"--ckpt-dir={ckpt_dir}",
+            f"--resume={ckpt_dir}",
         ]
+
+        # Auto-detect pre-tokenized data
+        tokenized_dir = "/data/tokenized"
+        if os.path.exists(os.path.join(tokenized_dir, "meta.json")):
+            cmd.append(f"--data-dir={tokenized_dir}")
 
         if trackio_space:
             cmd.append(f"--trackio-space={trackio_space}")
@@ -107,22 +122,97 @@ def status():
     import torch
 
     ckpt_vol.reload()
-    ckpt_path = "/checkpoints/latest.pt"
-
-    if not os.path.exists(ckpt_path):
-        print("No checkpoint found.")
+    base = "/checkpoints/phase5"
+    if not os.path.exists(base):
+        print("No phase5 checkpoints found.")
         return
 
-    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    print(f"Step: {ckpt.get('step', '?')}")
-    print(f"Loss: {ckpt.get('loss', '?')}")
-    print()
+    for run_dir in sorted(os.listdir(base)):
+        run_path = os.path.join(base, run_dir)
+        if not os.path.isdir(run_path):
+            continue
+        latest = os.path.join(run_path, "latest.pt")
+        if os.path.exists(latest):
+            ckpt = torch.load(latest, map_location="cpu", weights_only=False)
+            print(f"Run {run_dir}: step {ckpt.get('step', '?')}, loss {ckpt.get('loss', '?'):.4f}")
+        files = sorted(os.listdir(run_path))
+        for f in files:
+            path = os.path.join(run_path, f)
+            size_mb = os.path.getsize(path) / (1024 * 1024)
+            print(f"  {f:40s} {size_mb:8.1f} MB")
 
-    print("Checkpoints:")
-    for f in sorted(os.listdir("/checkpoints")):
-        path = os.path.join("/checkpoints", f)
-        size_mb = os.path.getsize(path) / (1024 * 1024)
-        print(f"  {f:40s} {size_mb:8.1f} MB")
+
+@app.function(
+    image=image,
+    gpu="A10G",
+    timeout=600,
+    volumes={"/checkpoints": ckpt_vol, "/data": data_vol},
+    secrets=[modal.Secret.from_name("huggingface-secret")],
+)
+def debug(run_id: str = "", ckpt_name: str = ""):
+    import os
+    import subprocess
+
+    os.environ["HF_HOME"] = "/data"
+    os.environ["HF_DATASETS_CACHE"] = "/data/datasets"
+    os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+    ckpt_vol.reload()
+    base = f"/checkpoints/phase5/{run_id}" if run_id else "/checkpoints/phase5"
+
+    # Find checkpoint
+    if ckpt_name:
+        ckpt_path = os.path.join(base, ckpt_name)
+    else:
+        # Find latest checkpoint
+        candidates = sorted(f for f in os.listdir(base) if f.startswith("ckpt_"))
+        if candidates:
+            ckpt_path = os.path.join(base, candidates[-1])
+        else:
+            print(f"No checkpoints found in {base}")
+            return
+    print(f"Using checkpoint: {ckpt_path}")
+
+    cmd = [
+        "python", "/root/05_phase5_dllm/debug_generate.py",
+        f"--ckpt={ckpt_path}", "--skip-data",
+    ]
+    proc = subprocess.run(cmd, capture_output=False)
+    if proc.returncode != 0:
+        print(f"Debug script failed with code {proc.returncode}")
+
+
+@app.function(
+    image=image,
+    cpu=8,
+    timeout=86400,
+    volumes={"/data": data_vol},
+    secrets=[modal.Secret.from_name("huggingface-secret")],
+)
+def pretokenize(max_tokens: int = 0):
+    import os
+    import subprocess
+
+    os.environ["HF_HOME"] = "/data"
+    os.environ["HF_DATASETS_CACHE"] = "/data/datasets"
+
+    cmd = [
+        "python", "/root/05_phase5_dllm/pretokenize.py",
+        "--out-dir", "/data/tokenized",
+    ]
+    if max_tokens > 0:
+        cmd.extend(["--max-tokens", str(max_tokens)])
+
+    print(f"Running: {' '.join(cmd)}")
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    for line in proc.stdout:
+        print(line, end="")
+    proc.wait()
+
+    data_vol.commit()
+
+    if proc.returncode != 0:
+        raise subprocess.CalledProcessError(proc.returncode, cmd)
 
 
 @app.function(
@@ -139,5 +229,12 @@ def main(
     gpu: str = "A100-80GB:8",
     trackio_space: str = "",
     extra_args: str = "",
+    run_id: str = "",
 ):
-    Train.with_options(gpu=gpu)().run.remote(trackio_space=trackio_space, extra_args=extra_args)
+    if not run_id:
+        import datetime
+        run_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    print(f"Run ID: {run_id}  (checkpoints at /checkpoints/phase5/{run_id}/)")
+    Train.with_options(gpu=gpu)().run.remote(
+        trackio_space=trackio_space, extra_args=extra_args, run_id=run_id,
+    )

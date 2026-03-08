@@ -1,43 +1,47 @@
-"""
-Model: RMSNorm, SwiGLU MLP, Transformer Block, full Model with tied embeddings.
-"""
+"""Model: RMSNorm, SwiGLU MLP, Transformer Block, full Model with tied embeddings."""
 
 import math
 
 import torch
-import torch.nn as nn
+from torch import nn
 from torch.nn import functional as F
 from torch.utils.checkpoint import checkpoint as grad_checkpoint
 
-from .config import (
-    n_layer, n_embd, n_head, head_dim, n_kv_head, mlp_hidden,
-    vocab_size, seq_len, block_size, pad_token_id,
-    dropout, use_liger, use_grad_ckpt,
-)
 from .attention import MultiHeadAttention
-
-try:
-    from .loss import compute_loss
-except ImportError:
-    compute_loss = None
+from .config import (
+    dropout,
+    head_dim,
+    mlp_hidden,
+    n_embd,
+    n_layer,
+    seq_len,
+    use_grad_ckpt,
+    use_liger,
+    vocab_size,
+)
 
 
 # ============================================================================
 # RMSNorm
 # ============================================================================
 
+_RMS_EPS = 1e-5  # SmolLM2 spec
+
+
 def _make_rms_norm(dim):
     if use_liger:
         from liger_kernel.transformers import LigerRMSNorm
-        return LigerRMSNorm(dim)
-    if hasattr(nn, "RMSNorm"):
-        return nn.RMSNorm(dim)
+        return LigerRMSNorm(dim, eps=_RMS_EPS)
+    if hasattr(nn, 'RMSNorm'):
+        return nn.RMSNorm(dim, eps=_RMS_EPS)
+
     class _RMSNorm(nn.Module):
         def __init__(self, d):
             super().__init__()
             self.weight = nn.Parameter(torch.ones(d))
+
         def forward(self, x):
-            return F.rms_norm(x, (x.size(-1),)) * self.weight
+            return F.rms_norm(x, (x.size(-1),), self.weight, _RMS_EPS)
     return _RMSNorm(dim)
 
 
@@ -100,14 +104,20 @@ class Model(nn.Module):
         # Precompute RoPE for max(2*seq_len, 8192) positions
         rotary_len = max(seq_len * 2, 8192)
         cos, sin = self._precompute_rotary(rotary_len)
-        self.register_buffer("cos", cos, persistent=False)
-        self.register_buffer("sin", sin, persistent=False)
+        self.register_buffer('cos', cos, persistent=False)
+        self.register_buffer('sin', sin, persistent=False)
 
         self.blocks = nn.ModuleList([Block() for _ in range(n_layer)])
         self.final_norm = _make_rms_norm(n_embd)
         self.lm_head = nn.Linear(n_embd, vocab_size, bias=False)
 
         self.apply(self._init_weights)
+        # Scaled init for residual projections: std / sqrt(2 * n_layers)
+        # Ref: SmolLM2 vgpt2, LLaDA modeling_llada.py:129,155
+        residual_std = (1.0 / math.sqrt(n_embd)) / math.sqrt(2 * n_layer)
+        for block in self.blocks:
+            nn.init.normal_(block.attn.c_proj.weight, mean=0.0, std=residual_std)
+            nn.init.normal_(block.mlp.down_proj.weight, mean=0.0, std=residual_std)
         # Zero-init Gated Query Attention gates: sigmoid(0)=0.5 dampens attention at start
         for block in self.blocks:
             nn.init.zeros_(block.attn.w_gate.weight)
@@ -116,12 +126,14 @@ class Model(nn.Module):
 
     @staticmethod
     def _init_weights(module):
+        # SmolLM2-135M: std = 1/sqrt(hidden_size) = 1/sqrt(576) = 0.0417
+        std = 1.0 / math.sqrt(n_embd)
         if isinstance(module, nn.Linear):
-            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            nn.init.normal_(module.weight, mean=0.0, std=std)
             if module.bias is not None:
                 nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
-            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            nn.init.normal_(module.weight, mean=0.0, std=std)
 
     def _precompute_rotary(self, length, base=10000):
         channel_range = torch.arange(0, head_dim, 2, dtype=torch.float32)
@@ -160,17 +172,11 @@ class Model(nn.Module):
                 total += p.numel()
         return total
 
-    def forward(self, idx, targets=None, mask=None, elbo_weight=None,
-                attn_mask=None, positions=None, pos_offset=0):
-        """
-        Args:
-            idx: (B, T) token IDs. T=2L during training ([x_t || x_0]).
-            targets: (B, L) ground-truth IDs. None during generation.
-            mask: (B, L) bool — True where tokens were masked.
-            elbo_weight: (B, L) pre-computed ELBO importance weights.
-            attn_mask: BlockMask, float tensor, or None.
-            positions: (B, L) per-token RoPE positions from doc packing. None = sequential.
-            pos_offset: RoPE offset for KV-cached generation.
+    def forward(self, idx, targets=None, attn_mask=None, positions=None, pos_offset=0):
+        """Forward pass for training ([x_t || x_0]) and generation (single block).
+
+        Training: returns (hidden_states, None) — loss computed externally.
+        Generation: returns (logits, None) — lm_head applied internally.
         """
         B, T = idx.size()
 
@@ -212,25 +218,6 @@ class Model(nn.Module):
             logits = self.lm_head(x_pred)
             return logits, None
 
-        # Loss computation
-        if compute_loss is not None:
-            loss = compute_loss(x_pred, targets, mask, elbo_weight,
-                                self.lm_head.weight, use_liger=use_liger)
-        else:
-            # Inline fallback CE
-            logits = self.lm_head(x_pred)
-            per_token_loss = F.cross_entropy(
-                logits.view(-1, vocab_size), targets.view(-1), reduction="none"
-            ).view(B, L)
-
-            if mask is not None and elbo_weight is not None:
-                weighted = per_token_loss * mask.float() * elbo_weight
-                real_count = (targets != pad_token_id).float().sum().clamp(min=1)
-                loss = weighted.sum() / real_count
-            elif mask is not None:
-                real_count = (targets != pad_token_id).float().sum().clamp(min=1)
-                loss = (per_token_loss * mask.float()).sum() / real_count
-            else:
-                loss = per_token_loss.mean()
-
-        return None, loss
+        # Training: return hidden states — loss computed outside model
+        # (keeps Liger FLCE .item() graph breaks outside compiled blocks)
+        return x_pred, None
