@@ -9,7 +9,7 @@ import time
 import torch
 import torch.nn.functional as F
 
-from .config import block_size, device, eos_token_id, mask_token_id, pad_token_id
+from .config import block_size, eos_token_id, mask_token_id, pad_token_id
 
 
 def _add_gumbel_noise(logits, temperature):
@@ -31,8 +31,9 @@ def generate(model, encode_fn, decode_fn, prompt='', max_new_tokens=512,
     model.reset_kv_cache()
     model.set_cache_mode(False)
 
+    device = next(model.parameters()).device
+
     try:
-        # Encode prompt
         prompt_ids = encode_fn(prompt) if prompt else []
         prompt_len = len(prompt_ids)
         all_tokens = list(prompt_ids)

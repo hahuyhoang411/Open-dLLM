@@ -23,14 +23,17 @@ import pathlib
 
 from phase5 import config
 from phase5.attention import (
+    MultiHeadAttention,
     _apply_rotary_emb,
     build_staircase_mask,
 )
 from phase5.checkpoint import load_checkpoint, save_checkpoint
 from phase5.data import _compute_positions, _DocumentPacker
-from phase5.generate import _add_gumbel_noise
+from phase5.generate import _add_gumbel_noise, generate
 from phase5.loss import compute_loss
 from phase5.model import Model
+
+from torch.nn import functional as F
 from phase5.optim import MuonClip, _MaxLogitsTracker, build_adamw_optimizer, build_param_groups
 from phase5.schedule import (
     apply_noise,
@@ -469,21 +472,27 @@ class TestOptimizer:
         assert not torch.allclose(w_before, w_after), "Muon step didn't update weights"
 
     def test_qk_clip(self):
-        """QK-Clip should scale Q/K weights when max_logits > tau."""
+        """QK-Clip scales Q/K weights by sqrt(tau/max_logits) when triggered."""
+        import math
         torch.manual_seed(42)
         m = Model()
         opt = build_param_groups(m)
+        # Zero all grads so only QK-clip scaling acts (no Muon/AdamW update)
         for p in m.parameters():
             if p.requires_grad:
-                p.grad = torch.randn_like(p)
-        # Simulate high attention logit
-        _MaxLogitsTracker._tls.max_logits = 500.0  # > tau=100
+                p.grad = torch.zeros_like(p)
+        # Also zero weight decay for the QK group so p *= 1.0 before clip
+        for g in opt.param_groups:
+            if g.get('is_qk', False):
+                g['weight_decay'] = 0.0
+        _MaxLogitsTracker._tls.max_logits = 400.0  # > tau=100
         w_q_before = m.blocks[0].attn.c_q.weight.clone()
         opt.step()
         w_q_after = m.blocks[0].attn.c_q.weight
-        # Weight should be scaled down by gamma_sqrt = sqrt(100/500) = 0.447
-        # (also shifted by the update, so just check it changed)
-        assert not torch.allclose(w_q_before, w_q_after)
+        # With zero grad + zero WD, only QK-clip acts: p *= sqrt(100/400) = 0.5
+        expected_scale = math.sqrt(100.0 / 400.0)
+        assert torch.allclose(w_q_after, w_q_before * expected_scale, atol=1e-5), \
+            f'Expected scale {expected_scale}, got ratio {(w_q_after / w_q_before).mean():.4f}'
 
     def test_adamw_fallback(self):
         """build_adamw_optimizer creates valid AdamW."""
@@ -789,3 +798,625 @@ class TestIntegration:
         loss = compute_loss(hidden, targets, mask, elbo_w, m.lm_head.weight)
         assert loss.item() > 0
         assert not torch.isnan(loss) and not torch.isinf(loss)
+
+
+# ============================================================================
+# Tokenizer Tests
+# ============================================================================
+
+class TestTokenizer:
+    def test_vocab_size(self):
+        from phase5.tokenizer import load_tokenizer
+        tok = load_tokenizer()
+        assert tok.get_vocab_size() == 49_152
+
+    def test_encode_decode_roundtrip(self):
+        from phase5.tokenizer import encode, decode
+        text = "Hello, world! This is a test."
+        ids = encode(text)
+        assert isinstance(ids, list)
+        assert all(isinstance(i, int) for i in ids)
+        assert len(ids) > 0
+        reconstructed = decode(ids)
+        assert text in reconstructed or reconstructed.strip() == text.strip()
+
+    def test_encode_produces_valid_ids(self):
+        from phase5.tokenizer import encode
+        ids = encode("The quick brown fox jumps over the lazy dog.")
+        # All IDs should be >= 14 (specials are 0-13, real tokens start at 14)
+        assert all(i >= 14 for i in ids), f'Got special token ID in normal text: {[i for i in ids if i < 14]}'
+        # All IDs should be < vocab_size
+        assert all(i < 49_152 for i in ids)
+
+    def test_special_tokens_not_in_normal_text(self):
+        from phase5.tokenizer import encode
+        ids = encode("A normal English sentence without special tokens.")
+        assert config.mask_token_id not in ids
+        assert config.eos_token_id not in ids
+        assert config.pad_token_id not in ids
+
+    def test_encode_empty_string(self):
+        from phase5.tokenizer import encode
+        ids = encode("")
+        assert isinstance(ids, list)
+        assert len(ids) == 0
+
+
+# ============================================================================
+# Generate Tests (end-to-end)
+# ============================================================================
+
+class TestGenerateEndToEnd:
+    @pytest.fixture(autouse=True)
+    def model(self):
+        torch.manual_seed(42)
+        self.m = Model()
+        self.m.eval()
+        return self.m
+
+    def test_generate_produces_output(self):
+        """generate() returns non-empty decoded text."""
+        from phase5.tokenizer import encode, decode
+        result = generate(self.m, encode, decode,
+                         prompt='Hello', max_new_tokens=32,
+                         denoise_steps=3, temperature=0.8)
+        assert isinstance(result, str)
+        assert len(result) > 0
+
+    def test_generate_without_prompt(self):
+        """generate() works with empty prompt."""
+        from phase5.tokenizer import encode, decode
+        result = generate(self.m, encode, decode,
+                         prompt='', max_new_tokens=16,
+                         denoise_steps=2, temperature=1.0)
+        assert isinstance(result, str)
+
+    def test_generate_respects_max_tokens(self):
+        """Output tokens should not vastly exceed max_new_tokens."""
+        from phase5.tokenizer import encode, decode
+        result = generate(self.m, encode, decode,
+                         prompt='The', max_new_tokens=16,
+                         denoise_steps=2, temperature=0.5)
+        # Tokens can slightly exceed max_new_tokens due to block granularity
+        # (block_size=16), but should not be absurdly long
+        result_ids = encode(result) if result else []
+        prompt_ids = encode('The')
+        generated_count = len(result_ids) - len(prompt_ids)
+        # Allow up to 2x block_size overshoot due to block granularity
+        assert generated_count <= 16 + 2 * config.block_size
+
+    def test_generate_cleans_up_cache(self):
+        """generate() should reset KV cache on exit (no stale state)."""
+        from phase5.tokenizer import encode, decode
+        generate(self.m, encode, decode, prompt='Test',
+                max_new_tokens=16, denoise_steps=2)
+        # After generate, cache should be clean
+        for block in self.m.blocks:
+            assert block.attn.kv_cache is None
+            assert block.attn.cache_mode is False
+
+    def test_generate_restores_training_mode(self):
+        """generate() should restore model.training state."""
+        from phase5.tokenizer import encode, decode
+        self.m.train()
+        assert self.m.training is True
+        generate(self.m, encode, decode, prompt='Hi',
+                max_new_tokens=16, denoise_steps=2)
+        assert self.m.training is True
+
+    def test_generate_temperature_zero(self):
+        """Temperature=0 should be deterministic (greedy)."""
+        from phase5.tokenizer import encode, decode
+        torch.manual_seed(42)
+        r1 = generate(self.m, encode, decode, prompt='A',
+                     max_new_tokens=16, denoise_steps=3, temperature=0)
+        torch.manual_seed(42)
+        r2 = generate(self.m, encode, decode, prompt='A',
+                     max_new_tokens=16, denoise_steps=3, temperature=0)
+        assert r1 == r2
+
+
+# ============================================================================
+# Multi-Head Attention Tests (isolated)
+# ============================================================================
+
+class TestMultiHeadAttention:
+    @pytest.fixture(autouse=True)
+    def attn(self):
+        from phase5.model import _make_rms_norm
+        torch.manual_seed(42)
+        self.att = MultiHeadAttention(make_norm_fn=_make_rms_norm)
+        self.att.eval()
+        return self.att
+
+    def _make_rope(self, length):
+        """Make RoPE cos/sin for testing."""
+        d = config.head_dim
+        channel_range = torch.arange(0, d, 2, dtype=torch.float32)
+        inv_freq = 1.0 / (10000 ** (channel_range / d))
+        t = torch.arange(length, dtype=torch.float32)
+        freqs = torch.outer(t, inv_freq)
+        cos = freqs.cos()[None, :, None, :]
+        sin = freqs.sin()[None, :, None, :]
+        return cos, sin
+
+    def test_output_shape(self):
+        """Attention output matches input shape."""
+        B, T = 2, 32
+        x = torch.randn(B, T, config.n_embd)
+        cos, sin = self._make_rope(T)
+        out = self.att(x, cos, sin)
+        assert out.shape == (B, T, config.n_embd)
+
+    def test_gqa_ratio(self):
+        """GQA: 9 query heads, 3 KV heads (3:1 ratio)."""
+        assert self.att.c_q.out_features == config.n_head * config.head_dim  # 9*64=576
+        assert self.att.c_k.out_features == config.n_kv_head * config.head_dim  # 3*64=192
+        assert self.att.c_v.out_features == config.n_kv_head * config.head_dim  # 3*64=192
+
+    def test_gate_init_halves_output(self):
+        """Zero-init gate produces sigmoid(0)=0.5, halving SDPA output."""
+        # Gate is only zero-init'ed in Model.__init__(), so do it manually here
+        torch.nn.init.zeros_(self.att.w_gate.weight)
+        x = torch.randn(1, 4, config.n_embd)
+        gate = self.att.w_gate(x)
+        gate_sigmoid = torch.sigmoid(gate)
+        assert torch.allclose(gate_sigmoid, torch.full_like(gate_sigmoid, 0.5), atol=1e-6)
+
+    def test_with_dense_mask(self):
+        """Attention works with dense float mask (SDPA path)."""
+        B, T = 1, 32
+        x = torch.randn(B, T, config.n_embd)
+        cos, sin = self._make_rope(T)
+        mask = torch.zeros(T, T)
+        out = self.att(x, cos, sin, attn_mask=mask)
+        assert out.shape == (B, T, config.n_embd)
+        assert not torch.isnan(out).any()
+
+    def test_without_mask(self):
+        """Attention works without mask (is_causal=False path)."""
+        B, T = 1, 16
+        x = torch.randn(B, T, config.n_embd)
+        cos, sin = self._make_rope(T)
+        out = self.att(x, cos, sin, attn_mask=None)
+        assert out.shape == (B, T, config.n_embd)
+
+    def test_with_positions(self):
+        """Attention works with explicit per-token positions (doc packing path)."""
+        B, T = 2, 16
+        x = torch.randn(B, T, config.n_embd)
+        cos, sin = self._make_rope(64)  # precomputed for max positions
+        positions = torch.arange(T).unsqueeze(0).expand(B, -1)
+        out = self.att(x, cos, sin, positions=positions)
+        assert out.shape == (B, T, config.n_embd)
+
+    def test_training_rope_split(self):
+        """Training [x_t || x_0]: cos has L positions but T=2L tokens."""
+        B, L = 1, 32
+        T = 2 * L
+        x = torch.randn(B, T, config.n_embd)
+        cos, sin = self._make_rope(L)  # only L positions
+        out = self.att(x, cos, sin)
+        assert out.shape == (B, T, config.n_embd)
+
+    def test_kv_cache_grows(self):
+        """KV cache accumulates across calls."""
+        self.att.cache_mode = True
+        x1 = torch.randn(1, 16, config.n_embd)
+        x2 = torch.randn(1, 16, config.n_embd)
+        cos, sin = self._make_rope(32)
+
+        self.att(x1, cos[:, :16], sin[:, :16])
+        assert self.att.kv_cache is not None
+        k1, v1 = self.att.kv_cache
+        assert k1.shape[2] == 16
+
+        self.att(x2, cos[:, :16], sin[:, :16])
+        k2, v2 = self.att.kv_cache
+        assert k2.shape[2] == 32  # accumulated
+        self.att.reset_cache()
+
+    def test_gradients_flow_through_gate(self):
+        """Gradients flow through the gated query attention path."""
+        self.att.train()
+        x = torch.randn(1, 16, config.n_embd, requires_grad=True)
+        cos, sin = self._make_rope(16)
+        out = self.att(x, cos, sin)
+        out.sum().backward()
+        assert x.grad is not None
+        assert self.att.w_gate.weight.grad is not None
+
+
+# ============================================================================
+# Model Cache Mode Tests
+# ============================================================================
+
+class TestModelCacheModes:
+    @pytest.fixture(autouse=True)
+    def model(self):
+        torch.manual_seed(42)
+        self.m = Model()
+        self.m.eval()
+        return self.m
+
+    def test_set_cache_mode(self):
+        """set_cache_mode toggles caching without clearing existing cache."""
+        self.m.enable_kv_cache()
+        x = torch.randint(0, 49152, (1, 16))
+        self.m(x)  # fills cache
+        # Toggle off: cache should persist
+        self.m.set_cache_mode(False)
+        for block in self.m.blocks:
+            assert block.attn.cache_mode is False
+            assert block.attn.kv_cache is not None  # not cleared
+        self.m.reset_kv_cache()
+
+    def test_disable_kv_cache(self):
+        """disable_kv_cache clears both mode and cached data."""
+        self.m.enable_kv_cache()
+        x = torch.randint(0, 49152, (1, 16))
+        self.m(x)
+        self.m.disable_kv_cache()
+        for block in self.m.blocks:
+            assert block.attn.cache_mode is False
+            assert block.attn.kv_cache is None  # cleared
+
+
+# ============================================================================
+# Rotary Embedding Wrapper Tests
+# ============================================================================
+
+class TestApplyRotaryEmbPair:
+    def test_apply_rotary_emb_pair(self):
+        """apply_rotary_emb applies RoPE to both Q and K."""
+        from phase5.attention import apply_rotary_emb
+        q = torch.randn(1, 4, 9, 64)
+        k = torch.randn(1, 4, 3, 64)
+        cos = torch.ones(1, 4, 1, 32)
+        sin = torch.zeros(1, 4, 1, 32)
+        q_out, k_out = apply_rotary_emb(q, k, cos, sin)
+        # With cos=1, sin=0: identity
+        assert torch.allclose(q_out, q, atol=1e-6)
+        assert torch.allclose(k_out, k, atol=1e-6)
+
+    def test_apply_rotary_emb_equivariance(self):
+        """RoPE preserves inner product when Q and K share the same rotation angle."""
+        from phase5.attention import apply_rotary_emb
+        torch.manual_seed(42)
+        q = torch.randn(1, 1, 1, 8)
+        k = torch.randn(1, 1, 1, 8)
+        # Use proper rotation angles (cos^2 + sin^2 = 1)
+        theta = torch.tensor([0.5, 1.0, 1.5, 2.0]).view(1, 1, 1, 4)
+        cos = theta.cos()
+        sin = theta.sin()
+        q_rot, k_rot = apply_rotary_emb(q, k, cos, sin)
+        # RoPE is a rotation: Q^T K is preserved when Q and K rotate by the same angle
+        # Compute proper inner product: sum over head_dim
+        dot_orig = (q.view(-1) * k.view(-1)).sum()
+        dot_rot = (q_rot.view(-1) * k_rot.view(-1)).sum()
+        assert torch.allclose(dot_orig, dot_rot, atol=1e-5), \
+            f'RoPE broke inner product: {dot_orig.item():.4f} vs {dot_rot.item():.4f}'
+
+
+# ============================================================================
+# MaxLogitsTracker Tests
+# ============================================================================
+
+class TestMaxLogitsTracker:
+    def test_update_and_consume(self):
+        _MaxLogitsTracker._tls.max_logits = None  # reset
+        _MaxLogitsTracker._update(5.0)
+        _MaxLogitsTracker._update(10.0)
+        _MaxLogitsTracker._update(3.0)
+        val = _MaxLogitsTracker.consume()
+        assert val == 10.0
+
+    def test_consume_resets(self):
+        _MaxLogitsTracker._tls.max_logits = None
+        _MaxLogitsTracker._update(7.0)
+        _MaxLogitsTracker.consume()
+        assert _MaxLogitsTracker.consume() is None
+
+    def test_update_with_tensors(self):
+        _MaxLogitsTracker._tls.max_logits = None
+        _MaxLogitsTracker._update(torch.tensor(5.0))
+        _MaxLogitsTracker._update(torch.tensor(12.0))
+        val = _MaxLogitsTracker.consume()
+        assert val == pytest.approx(12.0)
+
+    def test_mixed_tensor_and_float(self):
+        _MaxLogitsTracker._tls.max_logits = None
+        _MaxLogitsTracker._update(torch.tensor(5.0))
+        _MaxLogitsTracker._update(20.0)
+        val = _MaxLogitsTracker.consume()
+        assert val == pytest.approx(20.0)
+
+
+# ============================================================================
+# MuonClip AdamW Fallback Tests
+# ============================================================================
+
+class TestMuonClipAdamW:
+    def test_adamw_step_updates_1d_params(self):
+        """AdamW path handles 1D params (norms, biases)."""
+        torch.manual_seed(42)
+        m = Model()
+        opt = build_param_groups(m)
+        # Only norm weights are 1D in this model
+        norm_weight = m.blocks[0].attn_norm.weight.clone()
+        for p in m.parameters():
+            if p.requires_grad:
+                p.grad = torch.randn_like(p) * 0.01
+        opt.step()
+        # Norm weight should have changed (handled by AdamW group)
+        assert not torch.allclose(norm_weight, m.blocks[0].attn_norm.weight)
+
+    def test_adamw_bias_correction(self):
+        """AdamW step uses bias-corrected moments."""
+        p = torch.nn.Parameter(torch.randn(10))
+        p.grad = torch.ones(10)
+        opt = MuonClip([dict(params=[p], lr=0.01, betas=(0.9, 0.95),
+                             eps=1e-8, weight_decay=0.0, apply_muon=False)])
+        for pg in opt.param_groups:
+            pg['initial_lr'] = pg['lr']
+
+        p_before = p.data.clone()
+        opt.step()
+        p_after = p.data.clone()
+        # After one step with grad=1, p should decrease
+        assert (p_after < p_before).all()
+        # Check state was initialized
+        assert opt.state[p]['step'] == 1
+        assert 'exp_avg' in opt.state[p]
+        assert 'exp_avg_sq' in opt.state[p]
+
+    def test_weight_decay_applied(self):
+        """Both Muon and AdamW paths apply decoupled weight decay."""
+        p = torch.nn.Parameter(torch.ones(16, 16) * 2.0)
+        p.grad = torch.zeros(16, 16)  # zero grad: only WD acts
+        opt = MuonClip([dict(params=[p], lr=0.01, momentum=0.95,
+                             weight_decay=0.5, apply_muon=True)])
+        for pg in opt.param_groups:
+            pg['initial_lr'] = pg['lr']
+        opt.step()
+        # With zero grad and WD=0.5, p should shrink: p *= (1 - 0.01*0.5) = 0.995
+        expected = 2.0 * (1 - 0.01 * 0.5)
+        assert torch.allclose(p.data, torch.full_like(p.data, expected), atol=1e-4)
+
+
+# ============================================================================
+# FP8 Forward Numerics Tests
+# ============================================================================
+
+class TestFP8Numerics:
+    def test_to_fp8_scale_and_clamp(self):
+        """_to_fp8 scales tensor to fit FP8 range."""
+        from phase5.fp8 import _to_fp8
+        x = torch.randn(64, 64)
+        x_fp8, inv_scale = _to_fp8(x, torch.float8_e4m3fn)
+        # FP8 values should be within range (cast to float for .abs().max())
+        fp8_max = torch.finfo(torch.float8_e4m3fn).max
+        assert x_fp8.float().abs().max() <= fp8_max
+        # Inverse scale should approximately recover original magnitude
+        # E4M3 has ~3 bits mantissa → relative error up to ~12% for small values
+        recovered = x_fp8.float() * inv_scale
+        rel_error = (recovered - x).abs() / x.abs().clamp(min=0.01)
+        assert rel_error.median() < 0.1, f'Median relative error {rel_error.median():.3f} too high'
+
+    def test_to_fp8_preserves_sign(self):
+        from phase5.fp8 import _to_fp8
+        x = torch.tensor([-1.0, 0.0, 1.0, 2.0, -3.0])
+        x_fp8, inv_scale = _to_fp8(x, torch.float8_e4m3fn)
+        recovered = x_fp8.float() * inv_scale
+        # Signs should match
+        for i in range(len(x)):
+            if x[i] != 0:
+                assert recovered[i].sign() == x[i].sign()
+
+    @pytest.mark.skipif(not torch.cuda.is_available(),
+                        reason="FP8 matmul requires CUDA")
+    def test_float8_linear_forward_numerics(self):
+        """Float8Linear.forward produces results close to nn.Linear."""
+        from phase5.fp8 import Float8Linear
+        torch.manual_seed(42)
+        linear = torch.nn.Linear(64, 128, bias=False).cuda().bfloat16()
+        fp8 = Float8Linear.from_float(linear).cuda()
+        x = torch.randn(2, 16, 64, device='cuda', dtype=torch.bfloat16)
+
+        ref = F.linear(x, linear.weight)
+        fp8_out = fp8(x)
+
+        assert fp8_out.shape == ref.shape
+        # FP8 should be close but not exact
+        rel_error = (fp8_out - ref).abs().max() / ref.abs().max()
+        assert rel_error < 0.05, f'FP8 relative error {rel_error:.4f} too high'
+
+    @pytest.mark.skipif(not torch.cuda.is_available(),
+                        reason="FP8 backward requires CUDA")
+    def test_float8_linear_backward(self):
+        """Float8Linear backward produces non-zero gradients."""
+        from phase5.fp8 import Float8Linear
+        torch.manual_seed(42)
+        linear = torch.nn.Linear(64, 128, bias=False).cuda().bfloat16()
+        fp8 = Float8Linear.from_float(linear).cuda()
+        x = torch.randn(2, 16, 64, device='cuda', dtype=torch.bfloat16,
+                        requires_grad=True)
+
+        out = fp8(x)
+        out.sum().backward()
+        assert x.grad is not None
+        assert x.grad.abs().max() > 0
+        assert fp8.weight.grad is not None
+        assert fp8.weight.grad.abs().max() > 0
+
+
+# ============================================================================
+# PreTokenizedPacker Tests (with mock dataset)
+# ============================================================================
+
+class TestPreTokenizedPacker:
+    def test_epoch_style_no_replacement(self):
+        """_PreTokenizedPacker iterates without replacement within an epoch."""
+        import numpy as np
+
+        n_docs = 10
+        accessed_indices = []
+
+        class MockDataset:
+            def __len__(self):
+                return n_docs
+
+            def __getitem__(self, indices):
+                accessed_indices.extend(indices)
+                return {"input_ids": [list(range(14, 114)) for _ in indices]}
+
+        from phase5.data import _PreTokenizedPacker
+        packer = _PreTokenizedPacker.__new__(_PreTokenizedPacker)
+        packer._ds = MockDataset()
+        packer._n = n_docs
+        packer._rng = np.random.RandomState(42)
+        packer._eos_id = config.eos_token_id
+        packer._buf = []
+        packer._order = packer._rng.permutation(n_docs)
+        packer._cursor = 0
+
+        # Pull enough to consume all 10 docs
+        for _ in range(20):
+            packer._refill()
+
+        # First 10 indices should be a permutation of 0..9 (no replacement)
+        first_epoch = accessed_indices[:n_docs]
+        assert sorted(first_epoch) == list(range(n_docs)), \
+            f'First epoch not a permutation: {first_epoch}'
+
+    def test_epoch_boundary_reshuffles(self):
+        """Cursor resets and order reshuffles at epoch boundary."""
+        import numpy as np
+        from phase5.data import _PreTokenizedPacker
+
+        # Use larger n to make permutation collision astronomically unlikely
+        n_docs = 50
+        packer = _PreTokenizedPacker.__new__(_PreTokenizedPacker)
+        packer._n = n_docs
+        packer._rng = np.random.RandomState(42)
+        packer._order = packer._rng.permutation(n_docs)
+        packer._cursor = n_docs  # at epoch boundary
+
+        order_before = packer._order.copy()
+        packer._ds = type('', (), {
+            '__getitem__': lambda self, idx: {
+                "input_ids": [[14, 15, 16] for _ in idx]
+            }
+        })()
+        packer._eos_id = 1
+        packer._buf = []
+        packer._refill()
+
+        # Cursor should have reset and consumed a batch
+        assert packer._cursor > 0
+        assert packer._cursor <= n_docs
+        # Order should have been reshuffled (different permutation)
+        assert not np.array_equal(packer._order, order_before), \
+            'Order should change after epoch boundary reshuffle'
+
+
+# ============================================================================
+# Model Forward Path Tests
+# ============================================================================
+
+class TestModelForwardPaths:
+    @pytest.fixture(autouse=True)
+    def model(self):
+        torch.manual_seed(42)
+        self.m = Model()
+        self.m.eval()
+        return self.m
+
+    def test_inference_with_pos_offset(self):
+        """Inference with pos_offset shifts RoPE positions."""
+        x = torch.randint(0, 49152, (1, 16))
+        logits_0, _ = self.m(x, pos_offset=0)
+        logits_32, _ = self.m(x, pos_offset=32)
+        # Different pos_offset should give different logits
+        assert not torch.allclose(logits_0, logits_32)
+
+    def test_training_extracts_x_t_half(self):
+        """Training forward returns only x_t half (first L of 2L)."""
+        B, L = 2, 64
+        x_input = torch.randint(0, 49152, (B, 2 * L))
+        targets = torch.randint(14, 49152, (B, L))
+        attn_mask = build_staircase_mask(L, config.block_size)
+        hidden, _ = self.m(x_input, targets=targets, attn_mask=attn_mask)
+        assert hidden.shape == (B, L, config.n_embd)
+
+    def test_training_with_positions(self):
+        """Training with explicit positions uses per-token RoPE."""
+        B, L = 2, 64
+        x_input = torch.randint(0, 49152, (B, 2 * L))
+        targets = torch.randint(14, 49152, (B, L))
+        positions = torch.arange(L).unsqueeze(0).expand(B, -1)
+        attn_mask = build_staircase_mask(L, config.block_size)
+        hidden, _ = self.m(x_input, targets=targets, attn_mask=attn_mask,
+                          positions=positions)
+        assert hidden.shape == (B, L, config.n_embd)
+
+    def test_rope_positions_affect_output(self):
+        """Different document positions produce different outputs."""
+        B, L = 1, 64
+        x_input = torch.randint(0, 49152, (B, 2 * L))
+        targets = torch.randint(14, 49152, (B, L))
+        attn_mask = build_staircase_mask(L, config.block_size)
+
+        pos_sequential = torch.arange(L).unsqueeze(0)
+        pos_reset = torch.cat([torch.arange(32), torch.arange(32)]).unsqueeze(0)
+
+        h1, _ = self.m(x_input, targets=targets, attn_mask=attn_mask,
+                      positions=pos_sequential)
+        h2, _ = self.m(x_input, targets=targets, attn_mask=attn_mask,
+                      positions=pos_reset)
+        # Different positions produce different hidden states
+        assert not torch.allclose(h1, h2)
+
+
+# ============================================================================
+# Chunked Loss Tests
+# ============================================================================
+
+class TestChunkedLoss:
+    def test_chunked_matches_naive(self):
+        """Chunked CE with grad_checkpoint matches naive full-logits CE."""
+        torch.manual_seed(42)
+        B, L, D = 1, 32, 576
+        hidden = torch.randn(B, L, D)
+        targets = torch.randint(14, 49152, (B, L))
+        mask = torch.ones(B, L, dtype=torch.bool)
+        elbo_w = torch.ones(B, L)
+        lm_head_weight = torch.randn(49152, D)
+
+        # Chunked loss (our implementation)
+        loss_chunked = compute_loss(hidden, targets, mask, elbo_w, lm_head_weight)
+
+        # Naive loss (full logits materialized)
+        logits = hidden.view(-1, D) @ lm_head_weight.T
+        ce = F.cross_entropy(logits, targets.view(-1), reduction='none')
+        w = (mask.float() * elbo_w).view(-1)
+        real_count = (targets != config.pad_token_id).float().sum().clamp(min=1)
+        loss_naive = (ce * w).sum() / real_count
+
+        assert torch.allclose(loss_chunked, loss_naive, atol=1e-4), \
+            f'Chunked {loss_chunked.item():.6f} vs Naive {loss_naive.item():.6f}'
+
+    def test_loss_gradient_nonzero(self):
+        """Loss backward through chunked CE produces non-zero gradients."""
+        B, L, D = 1, 32, 576
+        hidden = torch.randn(B, L, D, requires_grad=True)
+        targets = torch.randint(14, 49152, (B, L))
+        mask = torch.ones(B, L, dtype=torch.bool)
+        elbo_w = torch.ones(B, L)
+        lm_head_weight = torch.randn(49152, D, requires_grad=True)
+
+        loss = compute_loss(hidden, targets, mask, elbo_w, lm_head_weight)
+        loss.backward()
+        assert hidden.grad is not None
+        assert hidden.grad.abs().max() > 0
+        assert lm_head_weight.grad is not None
