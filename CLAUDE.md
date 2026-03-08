@@ -36,7 +36,7 @@
 - Phase 4 CART weighting is OFF by default (enable with `--cart`). Loss normalization divides by all real tokens (not just masked) — [P4-19]
 - Phase 4 expected step-0 loss: ~10-11 (ln(32768)). If higher, check loss normalization and ELBO weighting
 - Modal training: `modal run modal_train.py` — uses volumes `dllm-checkpoints` + `dllm-data`, requires `huggingface-secret`
-- Phase 5 data: `--data-dir=HoangHa/100BT-dLLM-pretokenized` (HF Hub) or omit for streaming. Modal default is HF Hub, `train.py` default is streaming
+- Phase 5 data: Modal default is `HoangHa/100BT-dLLM-pretokenized`, `--data-dir streaming` for on-the-fly from `HuggingFaceFW/finepdfs_50BT-...`. `train.py` without `--data-dir` streams from source
 - Phase 5 pre-tokenize: `modal run modal_train.py::pretokenize` pushes to HF Hub (cpu=16, datasets.map)
 - Phase 5 is a package (`phase5/`) — no module-level parse_args() gotcha (config.py handles it)
 - Phase 5 uses self-contained MuonClip (no external muon-optimizer dependency)

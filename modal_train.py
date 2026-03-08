@@ -25,9 +25,9 @@ Usage:
     modal volume get dllm-checkpoints phase5/20260307_212400/latest.pt ./latest.pt
 
     # Data sources (--data-dir flag):
-    modal run modal_train.py                                              # HF Hub pre-tokenized (default)
-    modal run modal_train.py --data-dir streaming                         # on-the-fly tokenization
-    modal run modal_train.py --data-dir HoangHa/other-dataset             # different HF dataset
+    modal run modal_train.py                                              # HoangHa/100BT-dLLM-pretokenized (default)
+    modal run modal_train.py --data-dir streaming                         # HuggingFaceFW/finepdfs_50BT-... on-the-fly
+    modal run modal_train.py --data-dir HoangHa/other-dataset             # any other HF dataset
 
     # Pre-tokenize dataset and push to HF Hub
     modal run modal_train.py::pretokenize
@@ -191,6 +191,7 @@ def debug(run_id: str = "", ckpt_name: str = ""):
 @app.function(
     image=image,
     cpu=16,
+    memory=64 * 1024,
     timeout=86400,
     volumes={"/data": data_vol},
     secrets=[modal.Secret.from_name("huggingface-secret")],
@@ -207,6 +208,7 @@ def pretokenize(max_docs: int = 0, hub_repo: str = "HoangHa/100BT-dLLM-pretokeni
         "python", "/root/05_phase5_dllm/pretokenize.py",
         f"--hub-repo={hub_repo}",
         "--num-proc=16",
+        "--work-dir=/data/tmp_shards",
     ]
     if max_docs > 0:
         cmd.extend(["--max-docs", str(max_docs)])
@@ -222,7 +224,7 @@ def pretokenize(max_docs: int = 0, hub_repo: str = "HoangHa/100BT-dLLM-pretokeni
     if proc.returncode != 0:
         raise subprocess.CalledProcessError(proc.returncode, cmd)
 
-    # Cleanup: remove intermediate Arrow cache to free volume space
+    # Cleanup: remove intermediate caches to free volume space
     import shutil
     cache_dir = "/data/datasets"
     for item in os.listdir(cache_dir):
@@ -230,6 +232,9 @@ def pretokenize(max_docs: int = 0, hub_repo: str = "HoangHa/100BT-dLLM-pretokeni
         if os.path.isdir(path) and "finepdfs" in item:
             print(f"Cleaning up source cache: {path}")
             shutil.rmtree(path)
+    if os.path.isdir("/data/tmp_shards"):
+        print("Cleaning up tokenized shards work dir")
+        shutil.rmtree("/data/tmp_shards")
     data_vol.commit()
 
 
