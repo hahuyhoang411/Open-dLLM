@@ -154,7 +154,7 @@ if __name__ == '__main__':
     print(f'  use_liger      = {config.use_liger}')
     print(f'  use_flex       = {config.use_flex}')
     print(f'  use_cart       = {config.use_cart}')
-    compile_mode = ('whole-model' if not config.use_grad_ckpt else 'per-block') if config.use_compile else 'off'
+    compile_mode = ('per-block' if config.use_grad_ckpt or config.use_liger else 'whole-model') if config.use_compile else 'off'
     print(f'  use_compile    = {config.use_compile} ({compile_mode})')
     print(f'  use_grad_ckpt  = {config.use_grad_ckpt}')
     print(f'  use_muon       = {config.use_muon}')
@@ -229,20 +229,20 @@ if __name__ == '__main__':
         print(f'FP8 training: converted {num_fp8}/{num_linear} linear layers')
 
     # Compile AFTER checkpoint loaded (torchtitan order: AC → load → compile → DDP)
-    # Without grad_ckpt: whole-model compile (cross-block fusion, fewer kernel launches)
-    #   - Liger in-model ops auto-disabled (Inductor fuses natively)
-    # With grad_ckpt: per-block compile (checkpoint() inside compiled graph crashes)
-    #   - Liger RMSNorm + SwiGLU used for eager-mode fusion
+    # Per-block compile when: grad_ckpt ON (checkpoint() inside compiled graph crashes)
+    #   OR Liger ON (Triton tl.constexpr breaks whole-model Inductor tracing)
+    # Whole-model compile: only when both grad_ckpt and Liger are OFF
     if config.use_compile:
-      if config.use_grad_ckpt:
+      if config.use_grad_ckpt or config.use_liger:
         for i, block in enumerate(raw_model.blocks):
           raw_model.blocks[i] = torch.compile(block, dynamic=False)
         if config.master_process:
-          print(f'torch.compile: per-block ({len(raw_model.blocks)} blocks)')
+          reason = '+'.join(filter(None, ['grad_ckpt' if config.use_grad_ckpt else '', 'liger' if config.use_liger else '']))
+          print(f'torch.compile: per-block ({len(raw_model.blocks)} blocks, {reason})')
       else:
         model = torch.compile(model, dynamic=False)
         if config.master_process:
-          print('torch.compile: whole-model (no grad_ckpt, no Liger in-model)')
+          print('torch.compile: whole-model (no grad_ckpt, no Liger)')
 
     if config.ddp:
       model = DDP(
