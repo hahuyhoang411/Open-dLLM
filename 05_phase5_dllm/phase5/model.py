@@ -5,7 +5,11 @@ import math
 import torch
 from torch import nn
 from torch.nn import functional as F
-from torch.utils.checkpoint import checkpoint as grad_checkpoint
+from torch.utils.checkpoint import (
+    checkpoint as grad_checkpoint,
+    CheckpointPolicy,
+    create_selective_checkpoint_contexts,
+)
 
 from .attention import MultiHeadAttention
 from .config import (
@@ -19,6 +23,43 @@ from .config import (
     use_liger,
     vocab_size,
 )
+
+
+# ============================================================================
+# Selective Activation Checkpointing (SAC)
+# ============================================================================
+# Save outputs of expensive ops (matmuls, attention); recompute cheap ops
+# (norms, activations, residual adds). Cuts grad_ckpt overhead from ~33%
+# to ~2-15% while preserving most memory savings.
+# Ref: torchtitan/distributed/activation_checkpoint.py
+
+_SAC_SAVE_OPS = {
+    torch.ops.aten.mm.default,                                           # nn.Linear (bias=False)
+    torch.ops.aten.addmm.default,                                       # nn.Linear (bias=True, defensive)
+    torch.ops.aten._scaled_mm.default,                                   # FP8 matmul (if not opaque)
+    torch.ops.aten._scaled_dot_product_flash_attention.default,          # SDPA flash
+    torch.ops.aten._scaled_dot_product_efficient_attention.default,      # SDPA efficient
+    torch.ops.aten._scaled_dot_product_cudnn_attention.default,          # SDPA cuDNN
+    torch.ops.aten._scaled_dot_product_attention_math.default,           # SDPA math fallback
+    torch.ops.aten._scaled_dot_product_fused_attention_overrideable.default,
+    torch.ops.aten.max.default,                                          # abs max (scaling factors, etc.)
+}
+
+# FlexAttention is a Higher-Order Op — add if available (PyTorch 2.10+, fixed in PR #150080)
+try:
+    _SAC_SAVE_OPS.add(torch._higher_order_ops.flex_attention)
+except AttributeError:
+    pass
+
+
+def _sac_policy(ctx, op, *args, **kwargs):
+    if op in _SAC_SAVE_OPS:
+        return CheckpointPolicy.MUST_SAVE
+    return CheckpointPolicy.PREFER_RECOMPUTE
+
+
+def _sac_context_fn():
+    return create_selective_checkpoint_contexts(_sac_policy)
 
 
 # ============================================================================
@@ -85,8 +126,11 @@ class Block(nn.Module):
 
     def forward(self, x, cos, sin, attn_mask=None, positions=None):
         if self.training and use_grad_ckpt:
-            return grad_checkpoint(self._forward, x, cos, sin, attn_mask, positions,
-                                   use_reentrant=False)
+            return grad_checkpoint(
+                self._forward, x, cos, sin, attn_mask, positions,
+                use_reentrant=False,
+                context_fn=_sac_context_fn,
+            )
         return self._forward(x, cos, sin, attn_mask=attn_mask, positions=positions)
 
 
