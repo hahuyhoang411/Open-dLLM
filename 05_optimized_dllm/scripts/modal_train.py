@@ -37,6 +37,12 @@ Usage:
     # Resume/upload from existing /data/tmp_shards only (skip tokenization)
     modal run modal_train.py::upload_from_shards
     modal run modal_train.py::upload_from_shards --num-proc 8 --max-shard-size 8GB
+
+    # DCLM CORE scoring (single checkpoint from HF Hub)
+    modal run modal_train.py::score --hf-repo HoangHa/smoldlm-144m --step 2000
+
+    # DCLM CORE scoring sweep (parallel, 10 A10G)
+    modal run modal_train.py::score_sweep --start 2000 --end 24000 --every 2000
 """
 
 import modal
@@ -54,6 +60,8 @@ image = (
     'trackio>=0.18.0',
     'jinja2>=3.0.0',
     'pyyaml>=6.0',
+    'safetensors>=0.4.0',
+    'huggingface_hub>=0.20.0',
   )
   .add_local_dir('05_optimized_dllm', '/root/05_optimized_dllm')
   .add_local_dir('eval', '/root/eval')
@@ -203,57 +211,87 @@ def debug(run_id: str = '', ckpt_name: str = ''):
   gpu='A10G',
   timeout=7200,
   volumes={'/checkpoints': ckpt_vol},
+  secrets=[modal.Secret.from_name('huggingface-secret')],
 )
 def score(
-  run_id: str = '20260309_221412',
   step: int = 0,
+  hf_repo: str = '',
+  run_id: str = '',
   mc_num: int = 128,
   mc_batch_size: int = 64,
   max_per_task: int = -1,
 ):
+  """DCLM CORE scoring on A10G. Loads from HF Hub (safetensors) or Modal volume (.pt)."""
+  import json
   import os
   import sys
+
   import torch
 
-  ckpt_vol.reload()
-
-  base = f'/checkpoints/phase5/{run_id}'
-  if step > 0:
-    ckpt_path = os.path.join(base, f'ckpt_{step:06d}.pt')
-  else:
-    ckpt_path = os.path.join(base, 'latest.pt')
-  if not os.path.exists(ckpt_path):
-    print(f'Checkpoint not found: {ckpt_path}')
-    available = sorted(f for f in os.listdir(base) if f.startswith('ckpt_')) if os.path.isdir(base) else []
-    print(f'Available: {available}')
-    return
-
-  sys.path.insert(0, '/root/05_optimized_dllm')
   sys.path.insert(0, '/root/eval')
-
-  from phase5.model import Model
-  from phase5.tokenizer import encode
-
   device = 'cuda'
-  model = Model().to(device)
-  ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
-  state_dict = ckpt['model_state_dict'] if 'model_state_dict' in ckpt else ckpt
-  model.load_state_dict(state_dict)
-  model.requires_grad_(False)
-  model.eval()
 
-  ckpt_step = ckpt.get('step', step)
-  ckpt_loss = ckpt.get('loss', 0.0)
-  param_count = sum(p.numel() for p in model.parameters())
-  print(f'Loaded: step={ckpt_step}, loss={ckpt_loss:.4f}, params={param_count:,}')
+  if hf_repo:
+    # --- Load from HuggingFace Hub (safetensors) ---
+    sys.path.insert(0, '/root/05_optimized_dllm/hf')
+    from modeling_smoldlm import SmolDLM
 
-  def model_fn(input_ids):
-    with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-      logits, _ = model(input_ids)
-    return logits
+    ckpt_file = f'checkpoints/model_step_{step:06d}.safetensors'
+    model = SmolDLM.from_pretrained(hf_repo, checkpoint=ckpt_file, device=device)
 
-  def tokenize_fn(text):
-    return encode(text)
+    from tokenizers import Tokenizer
+    tokenizer = Tokenizer.from_file(model._tokenizer_path)
+
+    # Read step metadata
+    from huggingface_hub import hf_hub_download
+    meta_path = hf_hub_download(hf_repo, f'checkpoints/model_step_{step:06d}.json')
+    with open(meta_path) as f:
+      meta = json.load(f)
+    ckpt_step = meta.get('step', step)
+    ckpt_loss = meta.get('loss', 0.0)
+    print(f'HF repo: {hf_repo}, step={ckpt_step}, loss={ckpt_loss:.4f}')
+
+    def model_fn(input_ids):
+      with torch.amp.autocast(device, dtype=torch.bfloat16):
+        return model(input_ids)  # SmolDLM returns logits directly
+
+    def tokenize_fn(text):
+      return tokenizer.encode(text).ids
+
+  else:
+    # --- Load from Modal volume (.pt format) ---
+    ckpt_vol.reload()
+    base = f'/checkpoints/phase5/{run_id}'
+    ckpt_path = os.path.join(base, f'ckpt_{step:06d}.pt') if step > 0 else os.path.join(base, 'latest.pt')
+    if not os.path.exists(ckpt_path):
+      print(f'Checkpoint not found: {ckpt_path}')
+      available = sorted(f for f in os.listdir(base) if f.startswith('ckpt_')) if os.path.isdir(base) else []
+      print(f'Available: {available}')
+      return {'__core_score__': 0.0, 'step': step, 'loss': 0.0, 'error': 'not_found'}
+
+    sys.path.insert(0, '/root/05_optimized_dllm')
+    from phase5.model import Model
+    from phase5.tokenizer import encode
+
+    model = Model().to(device)
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+    state_dict = ckpt['model_state_dict'] if 'model_state_dict' in ckpt else ckpt
+    model.load_state_dict(state_dict)
+    model.requires_grad_(False)
+    model.eval()
+
+    ckpt_step = ckpt.get('step', step)
+    ckpt_loss = ckpt.get('loss', 0.0)
+    param_count = sum(p.numel() for p in model.parameters())
+    print(f'Loaded: step={ckpt_step}, loss={ckpt_loss:.4f}, params={param_count:,}')
+
+    def model_fn(input_ids):
+      with torch.amp.autocast(device, dtype=torch.bfloat16):
+        logits, _ = model(input_ids)
+      return logits
+
+    def tokenize_fn(text):
+      return encode(text)
 
   from base_eval import run_core
 
@@ -262,7 +300,10 @@ def score(
     mc_num=mc_num, max_seq_len=2048, max_per_task=max_per_task,
     pad_token_id=2, mc_batch_size=mc_batch_size,
   )
+  results['step'] = ckpt_step
+  results['loss'] = ckpt_loss
   print(f'\n=== Step {ckpt_step} | CORE score: {results["__core_score__"]:.4f} ===')
+  return results
 
 
 @app.function(
@@ -565,3 +606,49 @@ def main(
     run_id=run_id,
     data_dir=data_dir,
   )
+
+
+@app.local_entrypoint()
+def score_sweep(
+  hf_repo: str = 'HoangHa/smoldlm-144m',
+  start: int = 2000,
+  end: int = 24000,
+  every: int = 2000,
+  mc_num: int = 128,
+  mc_batch_size: int = 64,
+):
+  """Parallel DCLM CORE scoring sweep across checkpoints on A10G."""
+  steps = list(range(start, end + 1, every))
+  print(f'CORE scoring sweep: {len(steps)} checkpoints from {hf_repo}')
+  print(f'Steps: {steps}')
+  print(f'MC samples: {mc_num}, batch size: {mc_batch_size}')
+  print()
+
+  # Spawn all scoring jobs in parallel — Modal schedules across available A10Gs
+  handles = []
+  for s in steps:
+    h = score.spawn(step=s, hf_repo=hf_repo, mc_num=mc_num, mc_batch_size=mc_batch_size)
+    handles.append((s, h))
+  print(f'Spawned {len(handles)} scoring jobs (up to 10 A10G concurrent)\n')
+
+  # Collect results as they complete
+  results = []
+  for s, h in handles:
+    try:
+      r = h.get()
+      core = r.get('__core_score__', 0.0) if r else 0.0
+      loss = r.get('loss', 0.0) if r else 0.0
+      results.append((s, loss, core))
+      print(f'  Step {s:6d} | loss={loss:.4f} | CORE={core:.4f}')
+    except Exception as e:
+      print(f'  Step {s:6d} | FAILED: {e}')
+      results.append((s, 0.0, 0.0))
+
+  # Summary table
+  print()
+  print('=' * 50)
+  print(f'{"Step":>8} | {"Loss":>8} | {"CORE":>8}')
+  print('-' * 50)
+  for s, loss, core in results:
+    print(f'{s:8d} | {loss:8.4f} | {core:8.4f}')
+  print('=' * 50)
