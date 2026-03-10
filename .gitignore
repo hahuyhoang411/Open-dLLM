@@ -214,7 +214,6 @@ kaggle/output/
 
 # Internal / non-educational files
 CLAUDE.md
-docs/plans/
-docs/research/
+docs/
 05_optimized_dllm/hf/
 05_optimized_dllm/vram_probe.py
