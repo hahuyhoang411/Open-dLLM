@@ -1,5 +1,5 @@
 [project]
-name = "open-dllm"
+name = "smoldlm"
 version = "0.1.0"
 description = "Learn diffusion language models from scratch, one phase at a time"
 readme = "README.md"

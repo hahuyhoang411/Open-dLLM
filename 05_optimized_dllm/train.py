@@ -289,7 +289,7 @@ if __name__ == '__main__':
         'use_cart': config.use_cart,
         'ddp_world_size': config.ddp_world_size,
       }
-      trackio_kw = {'project': 'open-dllm-phase5', 'config': trackio_cfg}
+      trackio_kw = {'project': 'smoldlm-phase5', 'config': trackio_cfg}
       if config.args.trackio_space:
         trackio_kw['space_id'] = config.args.trackio_space
       try:

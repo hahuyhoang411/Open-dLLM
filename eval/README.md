@@ -97,7 +97,7 @@ python eval/base_eval.py --model dllm --depth 6 --mc-num 128
 
 ## Technical Notes
 
-- Eval bundle cached at `~/.cache/open-dllm/eval_bundle/`
+- Eval bundle cached at `~/.cache/smoldlm/eval_bundle/`
 - YAML key is `icl_tasks` (list), CSV column is `"Eval Task"` for random baselines
 - MC sampling uses antithetic masks (stratified t values), not i.i.d. random
 - Few-shot examples are sampled deterministically per item (seed = 1234 + index)

@@ -1,7 +1,7 @@
 """
 block_dllm.py — A block diffusion language model trained on FineWeb-Edu.
 
-Phase 3 of Open-dLLM: upgrades from full-sequence diffusion (Phase 2) to
+Phase 3 of SmolDLM: upgrades from full-sequence diffusion (Phase 2) to
 block diffusion with a staircase attention mask and KV caching. Same BPE
 tokenizer (vocab=32768) and depth parametrization as Phase 2.
 

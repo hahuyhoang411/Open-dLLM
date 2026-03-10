@@ -1,7 +1,7 @@
 """
 modern_dllm.py — A modern block diffusion language model with fused kernels.
 
-Phase 4 of Open-dLLM: upgrades from Phase 3's block diffusion with modern
+Phase 4 of SmolDLM: upgrades from Phase 3's block diffusion with modern
 training infrastructure: AMP bf16, gradient checkpointing, Liger fused
 kernels (RMSNorm, SwiGLU, FusedLinearCrossEntropy), mask ratio bandwidth,
 and complementary masking. Targets 2xA10 (SM86, 24GB).
@@ -1563,7 +1563,7 @@ if __name__ == "__main__":
                 "use_muon": use_muon, "use_cart": use_cart,
                 "ddp_world_size": ddp_world_size,
             }
-            trackio_kwargs = {"project": "open-dllm-phase4", "config": trackio_config}
+            trackio_kwargs = {"project": "smoldlm-phase4", "config": trackio_config}
             if args.trackio_space:
                 trackio_kwargs["space_id"] = args.trackio_space
             try:

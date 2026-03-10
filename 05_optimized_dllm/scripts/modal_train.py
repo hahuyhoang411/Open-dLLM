@@ -1,5 +1,5 @@
 """
-modal_train.py — Modal training infrastructure for Phase 5 of Open-dLLM.
+modal_train.py — Modal training infrastructure for Phase 5 of SmolDLM.
 
 Usage:
     # Launch training (default: 8×A100-80GB)
@@ -10,7 +10,7 @@ Usage:
     modal run modal_train.py --gpu A10G       # single GPU (auto-detects, skips DDP)
 
     # With trackio dashboard
-    modal run modal_train.py --trackio-space HoangHa/open-dllm
+    modal run modal_train.py --trackio-space HoangHa/smoldlm
 
     # Custom architecture
     modal run modal_train.py --extra-args "--n-layer 12 --n-embd 576 --dropout 0.0"
@@ -22,11 +22,12 @@ Usage:
     modal run modal_train.py --run-id 20260307_212400
 
     # Download checkpoint from a run
-    modal volume get dllm-checkpoints phase5/20260307_212400/latest.pt ./latest.pt
+    modal volume get smoldlm-checkpoints phase5/20260307_212400/latest.pt ./latest.pt
 
     # Data sources (--data-dir flag):
-    modal run modal_train.py                                              # HoangHa/100BT-dLLM-pretokenized (default)
+    modal run modal_train.py                                              # HoangHa/100BT-dLLM-pretokenized (default, from HF Hub)
     modal run modal_train.py --data-dir streaming                         # HuggingFaceFW/finepdfs_50BT-... on-the-fly
+    modal run modal_train.py --data-dir /data/tmp_shards                  # local Modal volume (after pretokenize)
     modal run modal_train.py --data-dir HoangHa/other-dataset             # any other HF dataset
 
     # Pre-tokenize dataset and push to HF Hub
@@ -40,7 +41,7 @@ Usage:
 
 import modal
 
-app = modal.App('open-dllm-phase5')
+app = modal.App('smoldlm-phase5')
 
 image = (
   modal.Image
@@ -58,8 +59,8 @@ image = (
   .add_local_dir('eval', '/root/eval')
 )
 
-ckpt_vol = modal.Volume.from_name('dllm-checkpoints', create_if_missing=True)
-data_vol = modal.Volume.from_name('dllm-data', create_if_missing=True)
+ckpt_vol = modal.Volume.from_name('smoldlm-checkpoints', create_if_missing=True)
+data_vol = modal.Volume.from_name('smoldlm-data', create_if_missing=True)
 
 
 @app.cls(
@@ -77,7 +78,7 @@ class Train:
     trackio_space: str = '',
     extra_args: str = '',
     run_id: str = '',
-    data_dir: str = '/data/tmp_shards',
+    data_dir: str = 'HoangHa/100BT-dLLM-pretokenized',
   ):
     import os
     import subprocess
@@ -541,7 +542,7 @@ def push_to_hub(
 )
 def download():
   print('Use the Modal CLI to download checkpoints:')
-  print('  modal volume get dllm-checkpoints latest.pt ./latest.pt')
+  print('  modal volume get smoldlm-checkpoints latest.pt ./latest.pt')
 
 
 @app.local_entrypoint()
@@ -550,7 +551,7 @@ def main(
   trackio_space: str = '',
   extra_args: str = '',
   run_id: str = '',
-  data_dir: str = '/data/tmp_shards',
+  data_dir: str = 'HoangHa/100BT-dLLM-pretokenized',
 ):
   if not run_id:
     import datetime

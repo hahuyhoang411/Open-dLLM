@@ -34,8 +34,8 @@ You are the training run watchdog. GPU time = real money. Act decisively.
 
 ### How to Read Logs
 1. **Modal dashboard:** `modal run 05_optimized_dllm/scripts/modal_train.py::status` — shows step, loss per run
-2. **Trackio dashboard:** https://huggingface.co/spaces/HoangHa/open-dllm — live loss/grad/throughput curves
-3. **Checkpoint inspection:** `modal volume get dllm-checkpoints phase5/<run_id>/latest.pt` — download and inspect
+2. **Trackio dashboard:** https://huggingface.co/spaces/HoangHa/smoldlm — live loss/grad/throughput curves
+3. **Checkpoint inspection:** `modal volume get smoldlm-checkpoints phase5/<run_id>/latest.pt` — download and inspect
 
 ### Step-0 Sanity (first log line)
 | Phase | Expected step-0 loss | STOP threshold |

@@ -1,4 +1,4 @@
-# Open-dLLM: Building Diffusion Language Models from Scratch
+# SmolDLM: Building Diffusion Language Models from Scratch
 
 *A learning journey from "what is a dLLM?" to a 144M-param production block diffusion LM — in 5 phases.*
 
@@ -701,4 +701,4 @@ Beyond longer training:
 
 *Built with PyTorch. Trained on Kaggle, Modal, and H100 clusters. Explained with ASCII diagrams. From 10.7M params on Tiny Shakespeare to 144M params on 100B tokens — every bug documented, every lesson earned.*
 
-*Code at [github.com/hahuyhoang411/Open-dLLM](https://github.com/hahuyhoang411/Open-dLLM).*
+*Code at [github.com/hahuyhoang411/SmolDLM](https://github.com/hahuyhoang411/SmolDLM).*

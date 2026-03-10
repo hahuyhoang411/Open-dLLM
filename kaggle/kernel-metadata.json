@@ -1,6 +1,6 @@
 {
-  "id": "hhoang41/open-dllm-phase4-training",
-  "title": "open-dllm-phase4-training",
+  "id": "hhoang41/smoldlm-phase4-training",
+  "title": "smoldlm-phase4-training",
   "code_file": "train_phase4.ipynb",
   "language": "python",
   "kernel_type": "notebook",

@@ -1,4 +1,4 @@
-# Open-dLLM
+# SmolDLM
 
 **Build diffusion language models from scratch, one phase at a time.**
 
@@ -103,8 +103,8 @@ Phase 5   30L / 576d / 9h / 3kv   144M params   + FP8, MuonClip, doc packing, li
 ### Phase 1: Hello Diffusion (start here)
 
 ```bash
-git clone https://github.com/hahuyhoang411/Open-dLLM.git
-cd Open-dLLM
+git clone https://github.com/hahuyhoang411/SmolDLM.git
+cd SmolDLM
 
 pip install torch
 
@@ -221,7 +221,7 @@ The `1/t` weight upweights low-noise timesteps (few masks, hard predictions) and
 ## Project Structure
 
 ```
-Open-dLLM/
+SmolDLM/
 ├── 01_hello_diffusion/         # Phase 1: char-level dLLM (~640 lines)
 │   ├── hello_diffusion.py
 │   └── download_data.py

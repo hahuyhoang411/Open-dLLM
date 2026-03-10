@@ -271,7 +271,7 @@ extending training by appending more stable steps before decay.
 modal run 05_phase5_dllm/scripts/modal_train.py --gpu A100-40GB:2
 ```
 
-Uses Modal volumes `dllm-checkpoints` + `dllm-data`, requires `huggingface-secret`.
+Uses Modal volumes `smoldlm-checkpoints` + `smoldlm-data`, requires `huggingface-secret`.
 
 ### Local (Multi-GPU)
 

@@ -1,5 +1,5 @@
 """
-base_eval.py — DCLM CORE evaluation CLI for Open-dLLM.
+base_eval.py — DCLM CORE evaluation CLI for SmolDLM.
 
 Downloads the eval bundle (tasks + metadata), loads either a dLLM or
 HuggingFace AR model, and runs all 22 DCLM CORE benchmark tasks.
@@ -51,7 +51,7 @@ except ImportError:
 # =============================================================================
 
 EVAL_BUNDLE_URL = "https://karpathy-public.s3.us-west-2.amazonaws.com/eval_bundle.zip"
-CACHE_DIR = os.path.expanduser("~/.cache/open-dllm")
+CACHE_DIR = os.path.expanduser("~/.cache/smoldlm")
 
 
 # =============================================================================
@@ -467,7 +467,7 @@ def run_core(model_fn, tokenize_fn, device, mode, mask_token_id,
 
 def main():
     parser = argparse.ArgumentParser(
-        description="DCLM CORE benchmark for Open-dLLM and HuggingFace models.",
+        description="DCLM CORE benchmark for SmolDLM and HuggingFace models.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""\
 examples:

@@ -1,7 +1,7 @@
 """
 nano_dllm.py — A BPE-level diffusion language model trained on FineWeb-Edu.
 
-Phase 2 of Open-dLLM: upgrades from char-level (Phase 1) to BPE tokenization,
+Phase 2 of SmolDLM: upgrades from char-level (Phase 1) to BPE tokenization,
 real web data (FineWeb-Edu streaming), cosine noise schedule, and SwiGLU MLP.
 
 The model is a depth-parametrized transformer where a single `depth` dial

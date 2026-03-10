@@ -1781,58 +1781,6 @@ wheels = [
 ]
 
 [[package]]
-name = "open-dllm"
-version = "0.1.0"
-source = { virtual = "." }
-dependencies = [
-    { name = "modal" },
-    { name = "torch" },
-    { name = "trackio" },
-]
-
-[package.optional-dependencies]
-eval = [
-    { name = "jinja2" },
-    { name = "pyyaml" },
-    { name = "transformers" },
-]
-phase2 = [
-    { name = "datasets" },
-    { name = "tokenizers" },
-]
-phase3 = [
-    { name = "datasets" },
-    { name = "tokenizers" },
-]
-phase4 = [
-    { name = "datasets" },
-    { name = "liger-kernel" },
-    { name = "muon-optimizer" },
-    { name = "tokenizers" },
-    { name = "trackio" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "datasets", marker = "extra == 'phase2'", specifier = ">=2.0.0" },
-    { name = "datasets", marker = "extra == 'phase3'", specifier = ">=2.0.0" },
-    { name = "datasets", marker = "extra == 'phase4'", specifier = ">=2.0.0" },
-    { name = "jinja2", marker = "extra == 'eval'", specifier = ">=3.0.0" },
-    { name = "liger-kernel", marker = "extra == 'phase4'", specifier = ">=0.4.0" },
-    { name = "modal", specifier = ">=1.3.5" },
-    { name = "muon-optimizer", marker = "extra == 'phase4'", git = "https://github.com/KellerJordan/Muon" },
-    { name = "pyyaml", marker = "extra == 'eval'", specifier = ">=6.0.0" },
-    { name = "tokenizers", marker = "extra == 'phase2'", specifier = ">=0.15.0" },
-    { name = "tokenizers", marker = "extra == 'phase3'", specifier = ">=0.15.0" },
-    { name = "tokenizers", marker = "extra == 'phase4'", specifier = ">=0.15.0" },
-    { name = "torch", specifier = ">=2.0.0" },
-    { name = "trackio", specifier = ">=0.18.0" },
-    { name = "trackio", marker = "extra == 'phase4'", specifier = ">=0.18.0" },
-    { name = "transformers", marker = "extra == 'eval'", specifier = ">=4.30.0" },
-]
-provides-extras = ["phase2", "phase3", "phase4", "eval"]
-
-[[package]]
 name = "orjson"
 version = "3.11.7"
 source = { registry = "https://pypi.org/simple" }
@@ -2761,6 +2709,68 @@ sdist = { url = "https://files.pythonhosted.org/packages/94/e7/b2c673351809dca68
 wheels = [
     { url = "https://files.pythonhosted.org/packages/b7/ce/149a00dd41f10bc29e5921b496af8b574d8413afcd5e30dfa0ed46c2cc5e/six-1.17.0-py2.py3-none-any.whl", hash = "sha256:4721f391ed90541fddacab5acf947aa0d3dc7d27b2e1e8eda2be8970586c3274", size = 11050, upload-time = "2024-12-04T17:35:26.475Z" },
 ]
+
+[[package]]
+name = "smoldlm"
+version = "0.1.0"
+source = { virtual = "." }
+dependencies = [
+    { name = "torch" },
+]
+
+[package.optional-dependencies]
+cloud = [
+    { name = "modal" },
+    { name = "trackio" },
+]
+eval = [
+    { name = "jinja2" },
+    { name = "pyyaml" },
+    { name = "transformers" },
+]
+phase2 = [
+    { name = "datasets" },
+    { name = "tokenizers" },
+]
+phase3 = [
+    { name = "datasets" },
+    { name = "tokenizers" },
+]
+phase4 = [
+    { name = "datasets" },
+    { name = "liger-kernel" },
+    { name = "muon-optimizer" },
+    { name = "tokenizers" },
+    { name = "trackio" },
+]
+phase5 = [
+    { name = "datasets" },
+    { name = "liger-kernel" },
+    { name = "tokenizers" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "datasets", marker = "extra == 'phase2'", specifier = ">=2.0.0" },
+    { name = "datasets", marker = "extra == 'phase3'", specifier = ">=2.0.0" },
+    { name = "datasets", marker = "extra == 'phase4'", specifier = ">=2.0.0" },
+    { name = "datasets", marker = "extra == 'phase5'", specifier = ">=2.0.0" },
+    { name = "jinja2", marker = "extra == 'eval'", specifier = ">=3.0.0" },
+    { name = "liger-kernel", marker = "extra == 'phase4'", specifier = ">=0.4.0" },
+    { name = "liger-kernel", marker = "extra == 'phase5'", specifier = ">=0.4.0" },
+    { name = "modal", marker = "extra == 'cloud'", specifier = ">=1.3.5" },
+    { name = "muon-optimizer", marker = "extra == 'phase4'", git = "https://github.com/KellerJordan/Muon" },
+    { name = "pyyaml", marker = "extra == 'eval'", specifier = ">=6.0.0" },
+    { name = "tokenizers", marker = "extra == 'phase2'", specifier = ">=0.15.0" },
+    { name = "tokenizers", marker = "extra == 'phase3'", specifier = ">=0.15.0" },
+    { name = "tokenizers", marker = "extra == 'phase4'", specifier = ">=0.15.0" },
+    { name = "tokenizers", marker = "extra == 'phase5'", specifier = ">=0.15.0" },
+    { name = "torch", specifier = ">=2.0.0" },
+    { name = "trackio", marker = "extra == 'cloud'", specifier = ">=0.18.0" },
+    { name = "trackio", marker = "extra == 'phase4'", specifier = ">=0.18.0" },
+    { name = "transformers", marker = "extra == 'eval'", specifier = ">=4.30.0" },
+]
+provides-extras = ["phase2", "phase3", "phase4", "phase5", "eval", "cloud"]
 
 [[package]]
 name = "starlette"
