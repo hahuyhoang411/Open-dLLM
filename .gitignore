@@ -209,6 +209,12 @@ __marimo__/
 # Project data and weights
 data.txt
 weights/
-docs/plans/
 refs/
 kaggle/output/
+
+# Internal / non-educational files
+CLAUDE.md
+docs/plans/
+docs/research/
+05_optimized_dllm/hf/
+05_optimized_dllm/vram_probe.py

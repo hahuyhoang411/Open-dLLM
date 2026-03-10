@@ -1,6 +1,6 @@
 """Component tests for Phase 5 block diffusion LM.
 
-Run: uv run python -m pytest 05_phase5_dllm/tests/test_phase5.py -v
+Run: uv run python -m pytest 05_optimized_dllm/tests/test_phase5.py -v
 All tests run on CPU — no GPU required.
 """
 

@@ -41,7 +41,6 @@ Architecture
     evaluate_task()             # score all items -> accuracy
 """
 
-import math
 import random
 
 from jinja2 import Template
@@ -319,76 +318,97 @@ def forward_model_ar(model_fn, input_ids):
 
 @torch.no_grad()
 def forward_model_dllm(model_fn, input_ids, start_idxs, end_idxs,
-                        mask_token_id, mc_num=64):
-    """Monte Carlo likelihood estimation for masked diffusion language models.
+                        mask_token_id, mc_num=128, mc_batch_size=64):
+    """Batched Monte Carlo likelihood estimation for masked diffusion LMs.
 
-    For each example, randomly masks answer-region tokens mc_num times using
-    a cosine schedule, computes importance-weighted CE, and averages.
+    Uses replica batching with antithetic masking (Dream/BD3-LMs pattern):
+    replicate each sequence mc_batch_size times, apply different masks per
+    replica in one batched forward pass. Linear schedule (mask_prob=t) with
+    ELBO importance weight 1/t.
 
     Args:
         model_fn: callable, input_ids (B,T) -> logits (B,T,V)
-        input_ids: LongTensor (B, T)
-        start_idxs: list[int] or LongTensor, answer start per example
-        end_idxs: list[int] or LongTensor, answer end per example
-        mask_token_id: int, the [MASK] token id
-        mc_num: int, number of Monte Carlo samples per example
+        input_ids: LongTensor (B, T) — B choices, padded to same length
+        start_idxs: list[int], answer region start per choice
+        end_idxs: list[int], answer region end per choice
+        mask_token_id: int
+        mc_num: int, total MC samples per choice (default 128)
+        mc_batch_size: int, replicas per forward pass (default 64, fits A10G)
 
     Returns:
-        losses: FloatTensor (B, T) — mean MC loss spread over answer region,
-                nan elsewhere
-        predictions: LongTensor (B, T) — argmax with all answer tokens masked
+        losses: FloatTensor (B, T) — ELBO loss spread over answer region, nan elsewhere
+        predictions: LongTensor (B, T) — argmax with fully-masked answer region
     """
     B, T = input_ids.shape
-    losses = torch.full((B, T), float("nan"), device=input_ids.device)
-    predictions = torch.zeros(B, T, dtype=torch.long, device=input_ids.device)
+    device = input_ids.device
+    losses = torch.full((B, T), float("nan"), device=device)
+    predictions = torch.zeros(B, T, dtype=torch.long, device=device)
 
     for i in range(B):
         si = int(start_idxs[i])
         ei = int(end_idxs[i])
         answer_len = ei - si
-        answer_tokens = input_ids[i, si:ei]  # (answer_len,)
 
-        # --- MC likelihood estimation ---
-        weighted_losses = []
-        for _ in range(mc_num):
-            t = random.random()  # uniform(0, 1)
-            mask_prob = 1.0 - math.cos(t * math.pi / 2) ** 2
+        # --- Batched MC likelihood estimation ---
+        u0 = torch.rand(1, device=device)
+        weighted_loss_sum = 0.0
+        total_samples = 0
 
-            # Randomly mask answer tokens with probability mask_prob
-            mask_draw = torch.rand(answer_len, device=input_ids.device)
-            mask_flags = mask_draw < mask_prob  # True = masked
+        for batch_start in range(0, mc_num, mc_batch_size):
+            cur_batch = min(mc_batch_size, mc_num - batch_start)
 
-            # If nothing got masked, force-mask one random answer token
-            if not mask_flags.any():
-                forced = random.randint(0, answer_len - 1)
-                mask_flags[forced] = True
+            # Antithetic t: uniform coverage of (0, 1]
+            indices = torch.arange(batch_start, batch_start + cur_batch,
+                                   device=device, dtype=torch.float32)
+            t = (u0 + indices / mc_num) % 1  # (cur_batch,)
+            t = t.clamp(min=0.01)  # avoid 1/t explosion
 
-            # Build masked input for this single example
-            masked_input = input_ids[i : i + 1].clone()  # (1, T)
-            masked_positions = torch.nonzero(mask_flags, as_tuple=True)[0] + si
-            masked_input[0, masked_positions] = mask_token_id
+            # Linear schedule: mask_prob = t
+            # Mask answer tokens per replica
+            answer_rand = torch.rand(cur_batch, answer_len, device=device)
+            mask_flags = answer_rand < t.unsqueeze(1)  # (cur_batch, answer_len)
 
-            # Forward pass on single example
-            logits = model_fn(masked_input)  # (1, T, V)
+            # Force at least 1 masked token per replica
+            no_mask = ~mask_flags.any(dim=1)
+            if no_mask.any():
+                forced = torch.randint(0, answer_len, (int(no_mask.sum()),),
+                                       device=device)
+                mask_flags[no_mask, forced] = True
 
-            # CE on masked positions only
+            # Build masked inputs: replicate and apply masks
+            seq = input_ids[i : i + 1].expand(cur_batch, -1).clone()
+            seq[:, si:ei] = torch.where(mask_flags, mask_token_id,
+                                        seq[:, si:ei])
+
+            # Batched forward pass — the critical speedup
+            logits = model_fn(seq)  # (cur_batch, T, V)
+
+            # CE on answer region, zero out unmasked positions
+            V = logits.shape[-1]
+            logits_answer = logits[:, si:ei, :].reshape(-1, V)
+            targets = input_ids[i, si:ei].unsqueeze(0).expand(cur_batch, -1)
             ce = F.cross_entropy(
-                logits[0, masked_positions],        # (num_masked, V)
-                input_ids[i, masked_positions],     # (num_masked,)
-                reduction="mean",
-            )
-            # Importance weight: divide by max(t, eps)
-            weighted_losses.append(ce / max(t, 1e-4))
+                logits_answer, targets.reshape(-1), reduction="none"
+            ).reshape(cur_batch, answer_len)
+            del logits, logits_answer  # free VRAM
 
-        mean_loss = torch.stack(weighted_losses).mean()
-        # Spread uniformly across answer region
+            # Per-replica: mean CE over masked positions, weighted by 1/t
+            ce_masked = ce * mask_flags.float()
+            num_masked = mask_flags.sum(dim=1).clamp(min=1)
+            per_replica_mean = ce_masked.sum(dim=1) / num_masked  # (cur_batch,)
+            weighted = per_replica_mean / t  # importance weight 1/t
+            weighted_loss_sum += weighted.sum().item()
+            total_samples += cur_batch
+
+        mean_loss = weighted_loss_sum / max(total_samples, 1)
         losses[i, si:ei] = mean_loss / answer_len
 
         # --- Prediction: fully-masked answer region, single forward ---
         pred_input = input_ids[i : i + 1].clone()
         pred_input[0, si:ei] = mask_token_id
-        pred_logits = model_fn(pred_input)  # (1, T, V)
+        pred_logits = model_fn(pred_input)
         predictions[i] = pred_logits[0].argmax(dim=-1)
+        del pred_logits
 
     return losses, predictions
 
@@ -398,8 +418,8 @@ def forward_model_dllm(model_fn, input_ids, start_idxs, end_idxs,
 # =============================================================================
 
 def evaluate_example(idx, model_fn, tokenize_fn, data, device, task_meta,
-                     mode="ar", mask_token_id=None, mc_num=64, max_seq_len=None,
-                     pad_token_id=None):
+                     mode="ar", mask_token_id=None, mc_num=128, max_seq_len=None,
+                     pad_token_id=None, mc_batch_size=64):
     """Evaluate a single DCLM CORE example and return whether prediction is correct.
 
     Handles the full pipeline: fewshot sampling -> prompt rendering -> tokenization
@@ -466,7 +486,8 @@ def evaluate_example(idx, model_fn, tokenize_fn, data, device, task_meta,
     elif mode == "dllm":
         assert mask_token_id is not None, "mask_token_id required for dllm mode"
         losses, predictions = forward_model_dllm(
-            model_fn, input_ids, start_idxs, end_idxs, mask_token_id, mc_num
+            model_fn, input_ids, start_idxs, end_idxs, mask_token_id,
+            mc_num, mc_batch_size,
         )
     else:
         raise ValueError(f"Unknown mode: {mode}")
@@ -507,31 +528,17 @@ def evaluate_example(idx, model_fn, tokenize_fn, data, device, task_meta,
 
 
 def evaluate_task(model_fn, tokenize_fn, data, device, task_meta,
-                  mode="ar", mask_token_id=None, mc_num=64, max_seq_len=None,
-                  pad_token_id=None):
-    """Evaluate all examples in a DCLM CORE task and return mean accuracy.
-
-    Args:
-        model_fn: callable, see forward_model_ar / forward_model_dllm
-        tokenize_fn: callable, text -> list[int]
-        data: list of dicts, the task dataset
-        device: torch device
-        task_meta: dict with keys 'task_type', 'continuation_delimiter', 'num_fewshot'
-        mode: 'ar' or 'dllm'
-        mask_token_id: int, required when mode='dllm'
-        mc_num: int, MC samples for dllm mode
-        max_seq_len: int or None, truncate from the left if sequences exceed this
-        pad_token_id: int or None, explicit padding token (falls back to mask_token_id)
-
-    Returns: float, accuracy in [0, 1]
-    """
+                  mode="ar", mask_token_id=None, mc_num=128, max_seq_len=None,
+                  pad_token_id=None, mc_batch_size=64):
+    """Evaluate all examples in a DCLM CORE task and return mean accuracy."""
     if not data:
         return 0.0
     correct = 0
     for idx in range(len(data)):
         if evaluate_example(
             idx, model_fn, tokenize_fn, data, device, task_meta,
-            mode, mask_token_id, mc_num, max_seq_len, pad_token_id
+            mode, mask_token_id, mc_num, max_seq_len, pad_token_id,
+            mc_batch_size,
         ):
             correct += 1
     return correct / len(data)

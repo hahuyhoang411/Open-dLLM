@@ -41,7 +41,7 @@ convention = 'google'
 
 # ML training code: relax rules that conflict with research conventions
 [lint.per-file-ignores]
-'05_phase5_dllm/**/*.py' = [
+'05_optimized_dllm/**/*.py' = [
   'ANN',      # type annotations — ML training code uses dynamic shapes/types
   'S101',     # asserts — used for shape/config validation, standard in ML
   'N803',     # uppercase argument names (G for gradient) — math convention
@@ -79,7 +79,7 @@ convention = 'google'
   'EM102',    # f-string in exception — inline is clearer for training errors
   'ERA001',   # commented-out code — shape annotations in comments
 ]
-'05_phase5_dllm/tests/**/*.py' = [
+'05_optimized_dllm/tests/**/*.py' = [
   'ANN',      # type annotations in tests
   'S101',     # asserts in tests (obviously)
   'N806',     # uppercase variables

@@ -1,9 +1,9 @@
 """Phase 5 training script — orchestrates all modules for block diffusion LM training.
 
 Usage:
-    uv run python 05_phase5_dllm/train.py --train
-    uv run python 05_phase5_dllm/train.py --prompt "Once upon a time"
-    torchrun --nproc_per_node=2 05_phase5_dllm/train.py --train
+    uv run python 05_optimized_dllm/train.py --train
+    uv run python 05_optimized_dllm/train.py --prompt "Once upon a time"
+    torchrun --nproc_per_node=2 05_optimized_dllm/train.py --train
 
 Architecture: 30L/576d/9h/3kv/1536MLP, ~144M params, linear noise schedule,
 MuonClip optimizer, document packing, Gated Query Attention.

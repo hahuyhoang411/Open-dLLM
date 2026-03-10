@@ -195,7 +195,7 @@ use_compile = not args.no_compile and torch.cuda.is_available()
 # Liger in-model ops (RMSNorm, SwiGLU) are incompatible with whole-model compile
 # (Liger Issue #174: tl.constexpr tracing failure). Inductor fuses these natively,
 # so Liger only helps in eager/per-block compile mode (i.e., when grad_ckpt is on).
-use_liger = not args.no_liger and _LIGER_AVAILABLE and use_grad_ckpt
+use_liger = not args.no_liger and _LIGER_AVAILABLE
 use_flex = not args.no_flex and _FLEX_AVAILABLE and torch.cuda.is_available()
 use_muon = not args.no_muon
 use_fp8 = args.fp8 and torch.cuda.is_available()

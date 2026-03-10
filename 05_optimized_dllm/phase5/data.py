@@ -117,9 +117,32 @@ class _PreTokenizedPacker:
   """
 
   def __init__(self, dataset_id, rank=0, world_size=1, seed=42):
-    from datasets import load_dataset as _load_ds
+    import os
+    from datasets import DatasetDict, concatenate_datasets, load_dataset as _load_ds, load_from_disk
 
-    ds = _load_ds(dataset_id, split='train')
+    if os.path.isdir(dataset_id):
+      # Local path: load shard dirs directly (skips HF Hub download)
+      shard_dirs = sorted(
+        d for d in (os.path.join(dataset_id, x) for x in os.listdir(dataset_id))
+        if os.path.isdir(d)
+      )
+      if shard_dirs:
+        ds = concatenate_datasets([load_from_disk(s) for s in shard_dirs])
+      else:
+        ds = load_from_disk(dataset_id)
+    else:
+      # HF Hub repo ID
+      loaded = _load_ds(dataset_id)
+      if isinstance(loaded, DatasetDict):
+        if 'train' in loaded:
+          ds = loaded['train']
+        else:
+          split_names = sorted((k for k in loaded.keys() if str(k).startswith('train_')), key=str)
+          if not split_names:
+            raise RuntimeError(f'No train or train_* splits found in {dataset_id}')
+          ds = concatenate_datasets([loaded[k] for k in split_names])
+      else:
+        ds = _load_ds(dataset_id, split='train')
     if world_size > 1:
       ds = ds.shard(num_shards=world_size, index=rank, contiguous=True)
     self._ds = ds

@@ -263,6 +263,51 @@ def load_modern_dllm_model(depth, seq_len, block_size, weights_path, device):
 
 
 # =============================================================================
+# Model Loading — Phase 5 dLLM (phase5 package)
+# =============================================================================
+
+def load_phase5_model(weights_path, device):
+    """Load the Phase 5 block diffusion model for scoring.
+
+    Phase 5 is a package (no module-level parse_args() gotcha).
+    Adds 05_optimized_dllm/ to sys.path, imports the model and tokenizer,
+    loads weights.
+
+    Returns: (model_fn, tokenize_fn, mask_token_id, pad_token_id, max_seq_len)
+    """
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    phase5_dir = os.path.join(repo_root, '05_optimized_dllm')
+
+    if phase5_dir not in sys.path:
+        sys.path.insert(0, phase5_dir)
+
+    from phase5.model import Model
+    from phase5.tokenizer import encode
+
+    model = Model().to(device)
+    print(f'Loading phase5 weights from {weights_path}')
+    state_dict = torch.load(weights_path, map_location=device, weights_only=True)
+    # Checkpoint may contain full checkpoint dict or raw state_dict
+    if 'model_state_dict' in state_dict:
+        state_dict = state_dict['model_state_dict']
+    model.load_state_dict(state_dict)
+    model.requires_grad_(False)
+
+    param_count = sum(p.numel() for p in model.parameters())
+    print(f'phase5 model loaded: params={param_count:,}, device={device}')
+
+    def model_fn(input_ids):
+        logits, _ = model(input_ids)
+        return logits
+
+    def tokenize_fn(text):
+        return encode(text)
+
+    # mask=0, pad=2, max_seq_len=2048
+    return model_fn, tokenize_fn, 0, 2, 2048
+
+
+# =============================================================================
 # Model Loading — HuggingFace AR
 # =============================================================================
 
@@ -298,7 +343,8 @@ def load_hf_model(hf_path, device):
 # =============================================================================
 
 def run_core(model_fn, tokenize_fn, device, mode, mask_token_id,
-             mc_num, max_seq_len, max_per_task, pad_token_id=None):
+             mc_num, max_seq_len, max_per_task, pad_token_id=None,
+             mc_batch_size=64):
     """Run all 22 DCLM CORE tasks and compute the CORE score.
 
     Returns: dict with per-task results and overall CORE score.
@@ -365,6 +411,7 @@ def run_core(model_fn, tokenize_fn, device, mode, mask_token_id,
             mode=mode, mask_token_id=mask_token_id,
             mc_num=mc_num, max_seq_len=max_seq_len,
             pad_token_id=pad_token_id,
+            mc_batch_size=mc_batch_size,
         )
         elapsed = time.time() - t0
 
@@ -433,8 +480,8 @@ examples:
     )
 
     parser.add_argument(
-        "--model", choices=["dllm", "block_dllm", "modern_dllm"],
-        help="Model type to score (dllm, block_dllm, or modern_dllm)",
+        "--model", choices=["dllm", "block_dllm", "modern_dllm", "phase5"],
+        help="Model type to score (dllm, block_dllm, modern_dllm, or phase5)",
     )
     parser.add_argument(
         "--depth", type=int, default=6,
@@ -522,6 +569,17 @@ examples:
             )
         model_fn, tokenize_fn, mask_token_id, pad_token_id, max_seq_len = load_modern_dllm_model(
             args.depth, args.seq_len, args.block_size, weights_path, device
+        )
+        mode = "dllm"
+    elif args.model == "phase5":
+        weights_path = args.weights
+        if weights_path is None:
+            repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            weights_path = os.path.join(
+                repo_root, "05_optimized_dllm", "weights", f"phase5_dllm_b{args.block_size}.pt",
+            )
+        model_fn, tokenize_fn, mask_token_id, pad_token_id, max_seq_len = load_phase5_model(
+            weights_path, device
         )
         mode = "dllm"
     else:

@@ -1,7 +1,7 @@
 """Diagnostic script: check model's generation behavior from checkpoint.
 
 Usage:
-    python 05_phase5_dllm/debug_generate.py --ckpt /path/to/ckpt_000500.pt
+    python 05_optimized_dllm/debug_generate.py --ckpt /path/to/ckpt_000500.pt
 
 Checks:
 1. Logit distribution at first denoise step (is it peaked?)
