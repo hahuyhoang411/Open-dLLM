@@ -349,6 +349,10 @@ def forward_model_dllm(model_fn, input_ids, start_idxs, end_idxs,
         ei = int(end_idxs[i])
         answer_len = ei - si
 
+        if answer_len <= 0:
+            predictions[i] = input_ids[i]
+            continue
+
         # --- Batched MC likelihood estimation ---
         u0 = torch.rand(1, device=device)
         weighted_loss_sum = 0.0
@@ -534,11 +538,14 @@ def evaluate_task(model_fn, tokenize_fn, data, device, task_meta,
     if not data:
         return 0.0
     correct = 0
-    for idx in range(len(data)):
+    total = len(data)
+    for idx in range(total):
         if evaluate_example(
             idx, model_fn, tokenize_fn, data, device, task_meta,
             mode, mask_token_id, mc_num, max_seq_len, pad_token_id,
             mc_batch_size,
         ):
             correct += 1
-    return correct / len(data)
+        if (idx + 1) % 50 == 0 or idx == total - 1:
+            print(f"    [{idx+1}/{total}] running acc={correct/(idx+1):.4f}", flush=True)
+    return correct / total

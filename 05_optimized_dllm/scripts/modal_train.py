@@ -209,7 +209,7 @@ def debug(run_id: str = '', ckpt_name: str = ''):
 @app.function(
   image=image,
   gpu='A10G',
-  timeout=7200,
+  timeout=14400,
   volumes={'/checkpoints': ckpt_vol},
   secrets=[modal.Secret.from_name('huggingface-secret')],
 )
