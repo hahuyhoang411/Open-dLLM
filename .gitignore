@@ -218,3 +218,4 @@ docs/
 05_optimized_dllm/hf/
 05_optimized_dllm/vram_probe.py
 .claude/
+/assets/

@@ -156,14 +156,27 @@ modal run modal_train.py
 
 | Metric | Value |
 |---|---|
-| Steps | 1,500 |
-| Loss | 19.11 --> 3.36 (val) |
+| Steps | 25,000 |
+| Loss | 19.11 --> 3.36 (val @ 1.5K) |
 | Throughput | 189K tok/s |
-| Tokens seen | ~1.57B |
 | VRAM peak | 57.9 / 85 GB (68%) |
 | Hardware | 4x H100 80GB, bf16, DDP |
 
-Loss curve monotonically decreasing, no anomalies. The model learns language structure by step 750 (generates coherent openings like "Vietnam, officially...") and has substantial remaining capacity -- no plateau in sight.
+### DCLM CORE Benchmarks
+
+| Task | Step 2,000 | Step 25,000 | Change |
+|---|---|---|---|
+| hellaswag | 27.0% | 30.0% | +3.0 |
+| piqa | 55.5% | 52.5% | -3.0 |
+| arc_easy | 27.5% | 29.0% | +1.5 |
+| commonsense_qa | 22.5% | 28.5% | +6.0 |
+| lambada_openai | 17.5% | 21.5% | +4.0 |
+| bigbench_qa_wikidata | 6.5% | 16.0% | +9.5 |
+| boolq | 56.0% | 50.0% | -6.0 |
+| copa | 51.0% | 45.0% | -6.0 |
+| **CORE (aggregate)** | **0.0650** | **0.0656** | **+0.0006** |
+
+Early training -- model is learning unevenly and far from converged. Quokka scaling laws predict 15B+ tokens needed at 144M. Training continues.
 
 ---
 
@@ -250,7 +263,7 @@ SmolDLM/
 ## Companion Documents
 
 - **[JOURNEY.md](JOURNEY.md)** -- The full learning narrative across all five phases: architecture decisions, training curves, what worked and what didn't. Start here if you want the story, not just the code.
-- **[BUGS.md](BUGS.md)** -- Every significant bug found during development, preserved for education. 15 bugs, 3 critical (silent correctness failures). Each traces symptom to root cause to fix. Most repos hide their bugs. We celebrate them.
+- **[BUGS.md](BUGS.md)** -- Every significant bug found during development, preserved for education. 23 bugs across 5 phases, 3 critical (silent correctness failures). Each traces symptom to root cause to fix. Most repos hide their bugs. We celebrate them.
 
 ---
 
