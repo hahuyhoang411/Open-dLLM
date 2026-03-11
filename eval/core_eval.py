@@ -318,17 +318,18 @@ def forward_model_ar(model_fn, input_ids):
 
 @torch.no_grad()
 def forward_model_dllm(model_fn, input_ids, start_idxs, end_idxs,
-                        mask_token_id, mc_num=128, mc_batch_size=64):
+                        mask_token_id, mc_num=128, mc_batch_size=64,
+                        need_predictions=True):
     """Monte Carlo ELBO likelihood estimation for masked diffusion LMs.
 
     Adapted from NVlabs/Fast-dLLM eval_llada.py. Uses k-based masking
-    (sample exact token count, not probability) with antithetic spreading
-    across MC replicas for low-variance ELBO estimation.
+    with antithetic spreading for low-variance ELBO estimation.
 
-    Key differences from probability-based masking:
-    - k >= 1 guaranteed (no empty-mask edge case)
-    - k spread via linspace across batch (uniform [1, target_len] coverage)
-    - Loss = sum(CE / p_mask) / batch_size (no per-replica mean normalization)
+    Optimizations over naive implementation:
+    - Vectorized shuffle via argsort (no Python loop over mc_batch_size)
+    - GPU-side loss accumulation (no .item() sync in inner loop)
+    - CE computed on answer region only (no full-sequence mask allocation)
+    - need_predictions=False skips prediction tracking (21/22 CORE tasks)
     """
     B, T = input_ids.shape
     device = input_ids.device
@@ -345,7 +346,7 @@ def forward_model_dllm(model_fn, input_ids, start_idxs, end_idxs,
             continue
 
         seq = input_ids[i : i + 1].expand(mc_batch_size, -1)
-        loss_acc = []
+        loss_sum = torch.zeros(1, device=device)
         best_mask_count = 0
         best_pred_logits = None
         n_iters = max(mc_num // mc_batch_size, 1)
@@ -357,43 +358,43 @@ def forward_model_dllm(model_fn, input_ids, start_idxs, end_idxs,
                 float(k), k + (mc_batch_size - 1) * (target_len / mc_batch_size),
                 steps=mc_batch_size, device=device,
             )).long()
-            x = ((x - 1) % target_len) + 1  # wrap to [1, target_len]
+            x = ((x - 1) % target_len) + 1
 
-            # Build mask: first x[j] positions True, then shuffle
+            # Vectorized shuffle: argsort of random values = batch of permutations
             idx = torch.arange(target_len, device=device).unsqueeze(0).expand(mc_batch_size, -1)
             answer_mask = idx < x.unsqueeze(1)
-            for j in range(mc_batch_size):
-                answer_mask[j] = answer_mask[j][torch.randperm(target_len, device=device)]
+            perm = torch.argsort(torch.rand(mc_batch_size, target_len, device=device), dim=1)
+            answer_mask = torch.gather(answer_mask, 1, perm)
 
             # Apply mask to answer region only
             noisy = seq.clone()
             noisy[:, si:ei] = torch.where(answer_mask, mask_token_id, seq[:, si:ei])
 
-            logits = model_fn(noisy)  # (mc_batch_size, T, V)
+            logits = model_fn(noisy)
 
-            # Extract prediction from highest-masking replica (saves 1 forward pass)
-            max_k = x.max().item()
-            if max_k > best_mask_count:
-                best_mask_count = max_k
-                best_pred_logits = logits[x.argmax()]
+            # Track prediction from highest-masking replica (LM tasks only)
+            if need_predictions:
+                max_k = x.max().item()
+                if max_k > best_mask_count:
+                    best_mask_count = max_k
+                    best_pred_logits = logits[x.argmax()]
 
-            # Fast-dLLM loss: CE / (k/target_len) per masked token, sum / batch
-            # Only compute on answer region where mask is True
-            full_mask = torch.zeros(mc_batch_size, T, dtype=torch.bool, device=device)
-            full_mask[:, si:ei] = answer_mask
-            p_mask = (x.float() / target_len).unsqueeze(1).expand(mc_batch_size, T)
+            # ELBO loss on answer region only (no full-seq mask allocation)
+            answer_logits = logits[:, si:ei]
+            answer_targets = seq[:, si:ei]
+            p_mask = (x.float() / target_len).unsqueeze(1).expand_as(answer_mask)
 
             ce = F.cross_entropy(
-                logits[full_mask], seq[full_mask],
+                answer_logits[answer_mask], answer_targets[answer_mask],
                 reduction='none',
-            ) / p_mask[full_mask]
-            loss_acc.append(ce.sum().item() / mc_batch_size)
-            del logits
+            ) / p_mask[answer_mask]
+            loss_sum += ce.sum() / mc_batch_size
+            del logits, answer_logits
 
-        mean_loss = sum(loss_acc) / len(loss_acc) if loss_acc else 0.0
-        losses[i, si:ei] = mean_loss / target_len
+        # GPU-side division — no .item() needed
+        losses[i, si:ei] = loss_sum / (n_iters * target_len)
 
-        if best_pred_logits is not None:
+        if need_predictions and best_pred_logits is not None:
             predictions[i] = best_pred_logits.argmax(dim=-1)
 
     return losses, predictions
@@ -474,6 +475,7 @@ def evaluate_example(idx, model_fn, tokenize_fn, data, device, task_meta,
         losses, predictions = forward_model_dllm(
             model_fn, input_ids, start_idxs, end_idxs, mask_token_id,
             mc_num, mc_batch_size,
+            need_predictions=(task_type == "language_modeling"),
         )
     else:
         raise ValueError(f"Unknown mode: {mode}")
