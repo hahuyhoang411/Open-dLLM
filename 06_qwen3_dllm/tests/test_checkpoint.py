@@ -15,17 +15,22 @@ from torch import nn
 
 def test_map_embed_tokens():
     from phase6.checkpoint import _map_hf_key
-    assert _map_hf_key('model.embed_tokens.weight') == 'token_emb.weight'
+    key, reason = _map_hf_key('model.embed_tokens.weight')
+    assert key == 'token_emb.weight'
+    assert reason is None
 
 
 def test_map_final_norm():
     from phase6.checkpoint import _map_hf_key
-    assert _map_hf_key('model.norm.weight') == 'final_norm.weight'
+    key, reason = _map_hf_key('model.norm.weight')
+    assert key == 'final_norm.weight'
 
 
 def test_map_lm_head_skipped():
     from phase6.checkpoint import _map_hf_key
-    assert _map_hf_key('lm_head.weight') is None
+    key, reason = _map_hf_key('lm_head.weight')
+    assert key is None
+    assert reason == 'tied'
 
 
 # ---------------------------------------------------------------------------
@@ -35,42 +40,47 @@ def test_map_lm_head_skipped():
 @pytest.mark.parametrize('idx', ['0', '15', '27'])
 def test_map_layer_attn_projs(idx):
     from phase6.checkpoint import _map_hf_key
-    assert _map_hf_key(f'model.layers.{idx}.self_attn.q_proj.weight') == f'blocks.{idx}.attn.c_q.weight'
-    assert _map_hf_key(f'model.layers.{idx}.self_attn.k_proj.weight') == f'blocks.{idx}.attn.c_k.weight'
-    assert _map_hf_key(f'model.layers.{idx}.self_attn.v_proj.weight') == f'blocks.{idx}.attn.c_v.weight'
-    assert _map_hf_key(f'model.layers.{idx}.self_attn.o_proj.weight') == f'blocks.{idx}.attn.c_proj.weight'
+    assert _map_hf_key(f'model.layers.{idx}.self_attn.q_proj.weight')[0] == f'blocks.{idx}.attn.c_q.weight'
+    assert _map_hf_key(f'model.layers.{idx}.self_attn.k_proj.weight')[0] == f'blocks.{idx}.attn.c_k.weight'
+    assert _map_hf_key(f'model.layers.{idx}.self_attn.v_proj.weight')[0] == f'blocks.{idx}.attn.c_v.weight'
+    assert _map_hf_key(f'model.layers.{idx}.self_attn.o_proj.weight')[0] == f'blocks.{idx}.attn.c_proj.weight'
 
 
 @pytest.mark.parametrize('idx', ['0', '15', '27'])
 def test_map_layer_qk_norms(idx):
     from phase6.checkpoint import _map_hf_key
-    assert _map_hf_key(f'model.layers.{idx}.self_attn.q_norm.weight') == f'blocks.{idx}.attn.q_norm.weight'
-    assert _map_hf_key(f'model.layers.{idx}.self_attn.k_norm.weight') == f'blocks.{idx}.attn.k_norm.weight'
+    assert _map_hf_key(f'model.layers.{idx}.self_attn.q_norm.weight')[0] == f'blocks.{idx}.attn.q_norm.weight'
+    assert _map_hf_key(f'model.layers.{idx}.self_attn.k_norm.weight')[0] == f'blocks.{idx}.attn.k_norm.weight'
 
 
 @pytest.mark.parametrize('idx', ['0', '15', '27'])
 def test_map_layer_mlp(idx):
     from phase6.checkpoint import _map_hf_key
-    assert _map_hf_key(f'model.layers.{idx}.mlp.gate_proj.weight') == f'blocks.{idx}.mlp.gate_proj.weight'
-    assert _map_hf_key(f'model.layers.{idx}.mlp.up_proj.weight') == f'blocks.{idx}.mlp.up_proj.weight'
-    assert _map_hf_key(f'model.layers.{idx}.mlp.down_proj.weight') == f'blocks.{idx}.mlp.down_proj.weight'
+    assert _map_hf_key(f'model.layers.{idx}.mlp.gate_proj.weight')[0] == f'blocks.{idx}.mlp.gate_proj.weight'
+    assert _map_hf_key(f'model.layers.{idx}.mlp.up_proj.weight')[0] == f'blocks.{idx}.mlp.up_proj.weight'
+    assert _map_hf_key(f'model.layers.{idx}.mlp.down_proj.weight')[0] == f'blocks.{idx}.mlp.down_proj.weight'
 
 
 @pytest.mark.parametrize('idx', ['0', '15', '27'])
 def test_map_layer_norms(idx):
     from phase6.checkpoint import _map_hf_key
-    assert _map_hf_key(f'model.layers.{idx}.input_layernorm.weight') == f'blocks.{idx}.attn_norm.weight'
-    assert _map_hf_key(f'model.layers.{idx}.post_attention_layernorm.weight') == f'blocks.{idx}.mlp_norm.weight'
+    assert _map_hf_key(f'model.layers.{idx}.input_layernorm.weight')[0] == f'blocks.{idx}.attn_norm.weight'
+    assert _map_hf_key(f'model.layers.{idx}.post_attention_layernorm.weight')[0] == f'blocks.{idx}.mlp_norm.weight'
 
 
 # ---------------------------------------------------------------------------
-# 3. _map_hf_key — unknown keys return None
+# 3. _map_hf_key — categorized skip reasons
 # ---------------------------------------------------------------------------
 
 def test_map_unknown_key():
     from phase6.checkpoint import _map_hf_key
-    assert _map_hf_key('model.layers.0.self_attn.rotary_emb.inv_freq') is None
-    assert _map_hf_key('some.random.key') is None
+    key, reason = _map_hf_key('model.layers.0.self_attn.rotary_emb.inv_freq')
+    assert key is None
+    assert reason == 'rotary_emb'
+
+    key2, reason2 = _map_hf_key('some.random.key')
+    assert key2 is None
+    assert reason2 == 'unknown'
 
 
 # ---------------------------------------------------------------------------
@@ -217,9 +227,8 @@ def test_load_from_hf_mock(monkeypatch):
 
     missing, unexpected = load_from_hf(model, model_name='fake/model', device='cpu')
 
-    # lm_head.weight is skipped (tied) → appears in unexpected HF keys
-    assert 'lm_head.weight' in unexpected
-    # lm_head.weight should NOT be in missing (tied to token_emb, loaded via token_emb)
+    # lm_head.weight is deliberately skipped (tied) → NOT in unexpected, NOT in missing
+    assert 'lm_head.weight' not in unexpected, "tied key should be in skipped, not unexpected"
     assert 'lm_head.weight' not in missing
     # token_emb should have been loaded
     assert torch.allclose(model.token_emb.weight, fake_sd['model.embed_tokens.weight'])
@@ -259,12 +268,11 @@ def test_load_from_hf_reports_missing_keys(monkeypatch):
 
 
 def test_load_from_hf_skips_rotary_emb(monkeypatch):
-    """rotary_emb.inv_freq in HF state should be silently skipped (not error)."""
+    """rotary_emb.inv_freq in HF state should be silently skipped (not error, not unexpected)."""
     from phase6.checkpoint import load_from_hf
     import phase6.checkpoint as ckpt_mod
 
     fake_sd = _build_fake_hf_state()
-    # Confirm rotary_emb keys exist
     assert any('rotary_emb' in k for k in fake_sd)
 
     def _mock_load(model_name):
@@ -275,5 +283,7 @@ def test_load_from_hf_skips_rotary_emb(monkeypatch):
     model = _FakeSmolDLM()
     missing, unexpected = load_from_hf(model, model_name='fake/model', device='cpu')
 
-    # rotary_emb keys should be in unexpected (unmapped HF keys)
-    assert any('rotary_emb' in k for k in unexpected)
+    # rotary_emb keys are categorized as 'rotary_emb' skip — NOT in unexpected
+    assert not any('rotary_emb' in k for k in unexpected), "rotary_emb should be skipped, not unexpected"
+    # No truly unexpected keys
+    assert len(unexpected) == 0

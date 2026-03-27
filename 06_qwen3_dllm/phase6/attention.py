@@ -297,7 +297,10 @@ class MultiHeadAttention(nn.Module):
                 repeats = n_head // n_kv_head
                 k = k.repeat_interleave(repeats, dim=1)
                 v = v.repeat_interleave(repeats, dim=1)
-            y = F.scaled_dot_product_attention(q, k, v, is_causal=False)
+            # Causal for AR prefill (no mask, no cache). Non-causal for block
+            # denoising (cache_mode active = iterating within a single block).
+            _causal = not self.cache_mode and self.kv_cache is None
+            y = F.scaled_dot_product_attention(q, k, v, is_causal=_causal)
 
         # Auto-cache current block's K,V after attention
         if self.cache_mode:

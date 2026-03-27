@@ -822,9 +822,8 @@ class TestCheckpointMappingExhaustive:
         model = Model(cfg)
         _, unexpected = load_from_hf(model, model_name='fake/qwen3', device='cpu')
 
-        rotary_keys = [k for k in unexpected if 'rotary_emb' in k]
-        assert len(rotary_keys) == cfg.n_layer, \
-            f"Expected {cfg.n_layer} rotary_emb keys in unexpected, got {len(rotary_keys)}"
+        # rotary_emb keys are now categorized as 'rotary_emb' skip, not unexpected
+        assert len(unexpected) == 0, f"Expected 0 unexpected keys, got {unexpected}"
 
 
 # ============================================================================

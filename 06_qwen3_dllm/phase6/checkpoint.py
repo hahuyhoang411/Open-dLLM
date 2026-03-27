@@ -86,18 +86,25 @@ _LAYER_MAP = {
 }
 
 
+# Keys we deliberately skip (not errors)
+_SKIP_KEYS = {'lm_head.weight'}  # tied to token_emb
+
+
 def _map_hf_key(hf_key):
-    """Map a single HF key to our naming convention. Returns None if unmapped."""
+    """Map a single HF key to our naming convention.
+    Returns (our_key, skip_reason) — our_key is None if unmapped, skip_reason explains why."""
     if hf_key in _HF_TO_OURS:
-        return _HF_TO_OURS[hf_key]
-    if hf_key == 'lm_head.weight':
-        return None  # tied to token_emb, skip
+        return _HF_TO_OURS[hf_key], None
+    if hf_key in _SKIP_KEYS:
+        return None, 'tied'
     m = re.match(r'model\.layers\.(\d+)\.(.*)', hf_key)
     if m:
         idx, rest = m.group(1), m.group(2)
         if rest in _LAYER_MAP:
-            return f'blocks.{idx}.{_LAYER_MAP[rest]}'
-    return None  # unknown (rotary_emb, etc.)
+            return f'blocks.{idx}.{_LAYER_MAP[rest]}', None
+    if 'rotary_emb' in hf_key:
+        return None, 'rotary_emb'
+    return None, 'unknown'
 
 
 # ---------------------------------------------------------------------------
@@ -124,13 +131,16 @@ def load_from_hf(model, model_name='Qwen/Qwen3-0.6B', device='cpu'):
 
     # Remap keys
     mapped = {}
+    skipped = {}  # reason → [keys]
     unexpected = []
     for hf_key, tensor in hf_sd.items():
-        our_key = _map_hf_key(hf_key)
+        our_key, skip_reason = _map_hf_key(hf_key)
         if our_key is not None:
             mapped[our_key] = tensor
-        else:
+        elif skip_reason == 'unknown':
             unexpected.append(hf_key)
+        else:
+            skipped.setdefault(skip_reason, []).append(hf_key)
 
     # Detect tied weights BEFORE load_state_dict breaks ties.
     # named_parameters() deduplicates tied params — a key in state_dict() but
@@ -156,9 +166,11 @@ def load_from_hf(model, model_name='Qwen/Qwen3-0.6B', device='cpu'):
     n_loaded = len(loaded_keys & model_keys)
     n_total = len(model_keys)
     print(f'[checkpoint] Loaded {n_loaded}/{n_total} params from {model_name}')
+    for reason, keys in skipped.items():
+        print(f'[checkpoint] Skipped ({reason}): {len(keys)} keys')
     if missing:
         print(f'[checkpoint] Missing ({len(missing)}): {missing[:5]}...' if len(missing) > 5 else f'[checkpoint] Missing ({len(missing)}): {missing}')
     if unexpected:
-        print(f'[checkpoint] Skipped HF keys ({len(unexpected)}): {unexpected[:5]}...' if len(unexpected) > 5 else f'[checkpoint] Skipped HF keys ({len(unexpected)}): {unexpected}')
+        print(f'[checkpoint] UNEXPECTED ({len(unexpected)}): {unexpected}')
 
     return missing, unexpected

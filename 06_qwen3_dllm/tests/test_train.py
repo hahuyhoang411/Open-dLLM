@@ -150,7 +150,7 @@ class TestHFLoadingPath:
             return partial
 
         monkeypatch.setattr(ckpt_mod, '_load_hf_weights', mock_load_hf_weights)
-        monkeypatch.setattr(ckpt_mod, '_map_hf_key', lambda k: k)
+        monkeypatch.setattr(ckpt_mod, '_map_hf_key', lambda k: (k, None))
 
         model = Model(TINY)
         missing, unexpected = ckpt_mod.load_from_hf(model, 'fake-model', 'cpu')

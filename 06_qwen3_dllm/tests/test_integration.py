@@ -534,13 +534,13 @@ class TestKVCacheConsistency:
         block_size = cfg.block_size
         block = torch.randint(0, cfg.vocab_size, (B, block_size))
 
-        # Fresh forward (no cache)
+        # Fresh forward (cache mode on but cache empty — bidirectional within block)
+        model.enable_kv_cache()
+        model.reset_kv_cache()
         with torch.no_grad():
             logits_fresh, _ = model(block, pos_offset=0)
 
         # Process some data to populate cache, then reset
-        model.enable_kv_cache()
-        model.reset_kv_cache()
         with torch.no_grad():
             model(torch.randint(0, cfg.vocab_size, (B, block_size)), pos_offset=0)
 
