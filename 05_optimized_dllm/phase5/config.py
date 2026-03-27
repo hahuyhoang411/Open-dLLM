@@ -44,7 +44,7 @@ def parse_args():
     p.add_argument('--no-compile', action='store_true', help='disable torch.compile')
     p.add_argument('--no-muon', action='store_true', help='use plain AdamW (no MuonClip)')
     p.add_argument('--fp8', action='store_true', help='enable FP8 training (requires H100+ GPU)')
-    p.add_argument('--cart', action='store_true', help='enable CART noise rescheduling (SFT only)')
+    p.add_argument('--cart', action='store_true', help='enable CART noise rescheduling (multiplied with ELBO weight)')
     p.add_argument('--cart-p', type=float, default=0.1, help='CART geometric param')
     p.add_argument('--t-min', type=float, default=0.1, help='min timestep (caps ELBO weight at 1/t_min)')
     # Data
@@ -145,7 +145,7 @@ grad_clip = 1.0
 # Noise schedule
 t_min = args.t_min  # clipped lower bound (caps ELBO weight at 1/t_min)
 
-# CART (off by default — only useful for SFT on pretrained models, not from-scratch)
+# CART (off by default — multiplied with ELBO 1/t weight when enabled)
 use_cart = args.cart
 cart_p = args.cart_p
 

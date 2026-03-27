@@ -273,12 +273,12 @@ def get_batch(split='train'):
   x_noisy, noise_mask = apply_noise(targets, t, pad_token_id=config.pad_token_id)
 
   # ELBO weights
+  elbo_w = compute_elbo_weight(t)  # (B, L) — 1/t base weight
   if config.use_cart:
-    # With doc packing, all tokens are real (no padding)
-    padding = torch.ones_like(targets, dtype=torch.bool)
-    elbo_w = compute_cart_weights(noise_mask, padding)
-  else:
-    elbo_w = compute_elbo_weight(t)  # (B, L)
+    # CART modulates ELBO: multiply context-adaptive scores on top of 1/t
+    # (Dream replaces 1/t; we keep both — preserves variational bound + locality)
+    padding = torch.ones_like(targets, dtype=torch.bool)  # doc packing = no padding
+    elbo_w = elbo_w * compute_cart_weights(noise_mask, padding)
 
   # Build [x_t || x_0] input (2L tokens)
   x_input = torch.cat([x_noisy, targets], dim=1)  # (B, 2L)
