@@ -41,6 +41,50 @@ convention = 'google'
 
 # ML training code: relax rules that conflict with research conventions
 [lint.per-file-ignores]
+'06_qwen3_dllm/**/*.py' = [
+  'ANN',      # type annotations — ML training code uses dynamic shapes/types
+  'S101',     # asserts — used for shape/config validation, standard in ML
+  'N803',     # uppercase argument names (G for gradient) — math convention
+  'N806',     # uppercase variable names (B, L, D, N) — ML convention
+  'N812',     # lowercase imported as non-lowercase — ML convention
+  'N817',     # CamelCase imported as acronym (DDP) — standard ML convention
+  'PLR2004',  # magic values in comparisons — constants in tests/training
+  'PLR6301',  # method could be function — test methods
+  'PLR6104',  # augmented assignment — readability in ML formulas
+  'PLR0912',  # too many branches — complex ML forward passes
+  'PLR0913',  # too many arguments — ML functions have many params
+  'PLR0914',  # too many local variables
+  'PLR0915',  # too many statements — complex ML functions
+  'PLR0917',  # too many positional arguments
+  'DOC201',   # return type in docstring but no annotation
+  'PTH',      # pathlib — os.path is fine for training scripts
+  'RUF059',   # unused variable prefixed with _
+  'RUF069',   # unnecessary chained comparison
+  'PLC0415',  # import not at top level — conditional imports for optional deps
+  'PLC2701',  # private name import — we expose _internal helpers for testing
+  'C408',     # unnecessary dict/list call
+  'ARG001',   # unused function argument — common in hook/callback patterns
+  'RET504',   # unnecessary assignment before return
+  'B007',     # unused loop variable
+  'FURB118',  # itemgetter — lambda is clearer for ML code
+  'PERF403',  # dict comprehension — explicit loop is clearer
+  'PERF203',  # try-except in loop — OOM sweep pattern
+  'SLF001',   # private member access — tests need to access internals
+  'RUF052',   # unused method argument starting with _
+  'PLW0603',  # global statement — module-level cache pattern in data.py
+  'PLW1508',  # env var default type — os.environ.get default is fine as int
+  'SIM108',   # ternary operator — readability preference in debug code
+  'FBT002',   # boolean default positional arg — common in ML APIs
+  'BLE001',   # blind Exception — defensive try/except for optional deps
+  'TRY003',   # long exception messages — descriptive errors for training bugs
+  'EM102',    # f-string in exception — inline is clearer for training errors
+  'ERA001',   # commented-out code — shape annotations in comments
+  'C901',     # complexity — profiling scripts are intentionally dense
+  'E731',     # lambda assignment — filter functions in ML code
+  'S102',     # exec — used for dynamic import validation in kernel test harness
+  'FBT003',   # boolean positional value — test record() calls use explicit True/False
+  'PLR1702',  # too many nested blocks — validation scripts have try/for/try nesting
+]
 '05_optimized_dllm/**/*.py' = [
   'ANN',      # type annotations — ML training code uses dynamic shapes/types
   'S101',     # asserts — used for shape/config validation, standard in ML
