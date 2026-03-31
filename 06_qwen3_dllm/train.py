@@ -245,6 +245,12 @@ if __name__ == '__main__':
     get_batch('train', cfg)
     if cfg.ddp:
       dist.barrier()
+
+    # Background prefetcher: builds next batch on CPU while GPU computes
+    from phase6.data import BatchPrefetcher
+
+    train_prefetcher = BatchPrefetcher(lambda: get_batch('train', cfg), maxsize=2)
+
     if cfg.master_process:
       print('Datasets ready.' + (' Compile warm-up may take 5-15 min...' if cfg.use_compile else ''))
       if torch.cuda.is_available():
@@ -336,7 +342,7 @@ if __name__ == '__main__':
         no_sync = cfg.ddp and micro_step < cfg.grad_accum_steps - 1
         ctx = model.no_sync() if no_sync else contextlib.nullcontext()
         with ctx:
-          x_input, targets, mask, elbo_w, doc_ids, positions = get_batch('train', cfg)
+          x_input, targets, mask, elbo_w, doc_ids, positions = train_prefetcher.get()
           attn_mask = _build_attn_mask(doc_ids, cfg)
           with torch.amp.autocast('cuda', dtype=torch.bfloat16, enabled=cfg.use_amp):
             hidden, _ = model(x_input, targets, attn_mask=attn_mask, positions=positions)
@@ -402,6 +408,9 @@ if __name__ == '__main__':
         pk = torch.cuda.max_memory_allocated() / 1e9
         tot = torch.cuda.get_device_properties(0).total_memory / 1e9
         print(f'VRAM step 0: {pk:.2f}/{tot:.1f} GB ({pk / tot * 100:.0f}%)')
+
+    # Stop background prefetcher
+    train_prefetcher.stop()
 
     # Save final checkpoint + weights
     if cfg.master_process:

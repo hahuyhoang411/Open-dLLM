@@ -29,6 +29,13 @@ phase5 = [
     "tokenizers>=0.15.0",
     "liger-kernel>=0.4.0",
 ]
+phase6 = [
+    "datasets>=2.0.0",
+    "transformers>=4.45.0",
+    "liger-kernel>=0.5.9",
+    "safetensors>=0.4.0",
+    "huggingface_hub>=0.20.0",
+]
 eval = [
     "jinja2>=3.0.0",
     "pyyaml>=6.0.0",

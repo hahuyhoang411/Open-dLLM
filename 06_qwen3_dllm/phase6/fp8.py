@@ -1,9 +1,13 @@
-"""FP8 training — tensorwise dynamic scaling, adapted from nanochat.
+"""FP8 training — per-row + per-tensor dynamic scaling, adapted from nanochat.
 
 Uses @allow_in_graph instead of torchao's tensor subclass approach.
 torchao + gradient checkpointing causes a 3x slowdown (subclass decomposition
 through every recomputed forward). The opaque-node approach avoids this entirely
 while calling the same cuBLAS _scaled_mm kernel.
+
+Forward uses per-row (rowwise) scaling for activations and weights — critical for
+block diffusion where ELBO weighting creates 10x dynamic range across tokens.
+Backward uses per-tensor scaling (transposed matmuls don't support rowwise cleanly).
 """
 
 from contextlib import contextmanager
@@ -15,14 +19,23 @@ EPS = 1e-12
 
 
 @torch.no_grad()
-def _to_fp8(x, fp8_dtype):
+def _to_fp8(x, fp8_dtype, rowwise=False):
     fp8_max = torch.finfo(fp8_dtype).max
-    amax = x.float().abs().max()
-    # float64 for scale — consistent numerics between compile and eager
-    scale = fp8_max / amax.double().clamp(min=EPS)
-    scale = scale.float()
-    x_fp8 = x.float().mul(scale).clamp(-fp8_max, fp8_max).to(fp8_dtype)
-    return x_fp8, scale.reciprocal()
+    if rowwise and x.ndim == 2:
+        # Per-row: scale each row independently for better precision
+        # _scaled_mm requires 2D scales: (M, 1) for scale_a, (1, N) for scale_b
+        amax = x.float().abs().amax(dim=1, keepdim=True).clamp(min=EPS)
+        scale = fp8_max / amax.double()
+        scale = scale.float()
+        x_fp8 = x.float().mul(scale).clamp(-fp8_max, fp8_max).to(fp8_dtype)
+        return x_fp8, scale.reciprocal()  # (M, 1) inverse scale
+    else:
+        # Per-tensor: single scale for the whole tensor
+        amax = x.float().abs().max()
+        scale = fp8_max / amax.double().clamp(min=EPS)
+        scale = scale.float()
+        x_fp8 = x.float().mul(scale).clamp(-fp8_max, fp8_max).to(fp8_dtype)
+        return x_fp8, scale.reciprocal()
 
 
 def _to_col_major(x):
@@ -33,15 +46,23 @@ def _to_col_major(x):
 class _Float8Matmul(torch.autograd.Function):
     @staticmethod
     def forward(ctx, input_2d, weight):
-        in_fp8, in_inv = _to_fp8(input_2d, torch.float8_e4m3fn)
-        w_fp8, w_inv = _to_fp8(weight, torch.float8_e4m3fn)
-        ctx.save_for_backward(in_fp8, in_inv, w_fp8, w_inv)
-        return torch._scaled_mm(
-            in_fp8, w_fp8.t(),
-            scale_a=in_inv, scale_b=w_inv,
+        # Forward: rowwise scaling for precision with ELBO-weighted tokens
+        # _scaled_mm rowwise requires scale_a=(M,1), scale_b=(1,N), both float32
+        in_fp8_row, in_inv_row = _to_fp8(input_2d, torch.float8_e4m3fn, rowwise=True)
+        w_fp8_row, w_inv_row = _to_fp8(weight, torch.float8_e4m3fn, rowwise=True)
+        # w_fp8_row.t() is (K,N), scale_b = w_inv_row.T is (1,N)
+        out = torch._scaled_mm(
+            in_fp8_row, w_fp8_row.t(),
+            scale_a=in_inv_row, scale_b=w_inv_row.t(),
             out_dtype=input_2d.dtype,
             use_fast_accum=True,
         )
+
+        # Backward: per-tensor (transposed matmuls don't support rowwise)
+        in_fp8, in_inv = _to_fp8(input_2d, torch.float8_e4m3fn)
+        w_fp8, w_inv = _to_fp8(weight, torch.float8_e4m3fn)
+        ctx.save_for_backward(in_fp8, in_inv, w_fp8, w_inv)
+        return out
 
     @staticmethod
     def backward(ctx, grad_output):
