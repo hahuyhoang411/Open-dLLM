@@ -54,7 +54,6 @@ def smart_offload_checkpoint(fn, *args, use_reentrant=False, context_fn=None, is
   _ensure_device_initialized(device)
   dev_idx = _get_dev_idx(device)
   extra_stream = _EXTRA_STREAMS[dev_idx]
-  main_stream = torch.cuda.current_stream(device)
 
   def pack_hook(tensor):
     global _tensor_counter
@@ -71,8 +70,9 @@ def smart_offload_checkpoint(fn, *args, use_reentrant=False, context_fn=None, is
     cpu_buf = torch.empty(tensor.numel(), dtype=tensor.dtype, device='cpu', pin_memory=True)
     flat = cpu_buf.view(tensor.shape)
 
-    # Async copy: sync extra stream with main, then copy on extra stream
-    extra_stream.wait_stream(main_stream)
+    # Async copy: sync extra stream with the *current* stream (may be backward
+    # stream during recomputation, not the forward-time main_stream)
+    extra_stream.wait_stream(torch.cuda.current_stream(tensor.device))
     with torch.cuda.stream(extra_stream):
       flat.copy_(tensor, non_blocking=True)
 
