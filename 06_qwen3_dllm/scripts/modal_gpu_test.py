@@ -18,7 +18,7 @@ app = modal.App('smoldlm-phase6-gpu-test')
 image = (
   modal.Image
   .debian_slim(python_version='3.11')
-  .pip_install(
+  .uv_pip_install(
     'torch>=2.5.0',
     'transformers>=4.45.0',
     'datasets>=2.0.0',
