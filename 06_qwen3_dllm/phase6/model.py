@@ -33,7 +33,6 @@ _SAC_SAVE_OPS = {
   torch.ops.aten._scaled_dot_product_cudnn_attention.default,
   torch.ops.aten._scaled_dot_product_attention_math.default,
   torch.ops.aten._scaled_dot_product_fused_attention_overrideable.default,
-  torch.ops.aten.max.default,
 }
 
 try:
@@ -68,7 +67,7 @@ class SwiGLU(nn.Module):
 
   def forward(self, x):
     gate, up = self.gate_proj(x), self.up_proj(x)
-    if self.cfg.use_liger:
+    if self.cfg.use_liger_swiglu:
       try:
         from liger_kernel.ops.swiglu import LigerSiLUMulFunction
 
@@ -94,11 +93,74 @@ class Block(nn.Module):
 
   def _forward(self, x, cos, sin, attn_mask=None, positions=None):
     x = x + self.attn(self.attn_norm(x), cos, sin, attn_mask=attn_mask, positions=positions)
-    x = x + self.mlp(self.mlp_norm(x))
+    if self.cfg.use_tiled_mlp:
+      from .tiled_mlp import tiled_mlp_forward
+
+      x = x + tiled_mlp_forward(self.mlp, self.mlp_norm(x), chunk_size=self.cfg.tiled_mlp_chunk)
+    else:
+      x = x + self.mlp(self.mlp_norm(x))
     return x
 
   def forward(self, x, cos, sin, attn_mask=None, positions=None):
     if self.training and self.cfg.use_grad_ckpt:
+      # Select checkpoint function based on VRAM reduction config
+      if self.cfg.use_offload_ckpt:
+        if self.cfg.offload_strategy == 'simple':
+          from .offload_simple import simple_offload_checkpoint
+
+          return simple_offload_checkpoint(
+            self._forward,
+            x,
+            cos,
+            sin,
+            attn_mask,
+            positions,
+            use_reentrant=False,
+            context_fn=_sac_context_fn,
+          )
+        if self.cfg.offload_strategy == 'smart':
+          from .offload_smart import smart_offload_checkpoint
+
+          return smart_offload_checkpoint(
+            self._forward,
+            x,
+            cos,
+            sin,
+            attn_mask,
+            positions,
+            use_reentrant=False,
+            context_fn=_sac_context_fn,
+            is_last_layer=getattr(self, '_is_last_layer', False),
+          )
+        if self.cfg.offload_strategy == 'compress':
+          from .activation_compress import compressed_checkpoint
+
+          return compressed_checkpoint(
+            self._forward,
+            x,
+            cos,
+            sin,
+            attn_mask,
+            positions,
+            use_reentrant=False,
+            context_fn=_sac_context_fn,
+          )
+        raise ValueError(f'Unknown offload_strategy: {self.cfg.offload_strategy}')
+      if self.cfg.use_sqrt_ckpt:
+        # Boolean flag — only 2 torch.compile specializations (True/False)
+        # instead of N specializations for integer block indices
+        if getattr(self, '_use_checkpoint', True):
+          return grad_checkpoint(
+            self._forward,
+            x,
+            cos,
+            sin,
+            attn_mask,
+            positions,
+            use_reentrant=False,
+            context_fn=_sac_context_fn,
+          )
+        return self._forward(x, cos, sin, attn_mask=attn_mask, positions=positions)
       return grad_checkpoint(
         self._forward,
         x,
@@ -136,16 +198,19 @@ class Model(nn.Module):
     self.register_buffer('cos', cos, persistent=False)
     self.register_buffer('sin', sin, persistent=False)
 
-    # Pre-doubled buffers for training [x_t || x_0] of length 2L.
-    # Both halves share positions 0..L-1, so we repeat once along dim=1.
-    # Shape: (1, 2*seq_len, 1, head_dim//2) — matches T=2L in forward.
-    L = cfg.seq_len
-    cos_2x = cos[:, :L].repeat(1, 2, 1, 1)
-    sin_2x = sin[:, :L].repeat(1, 2, 1, 1)
-    self.register_buffer('cos_2x', cos_2x, persistent=False)
-    self.register_buffer('sin_2x', sin_2x, persistent=False)
-
     self.blocks = nn.ModuleList([Block(cfg) for _ in range(cfg.n_layer)])
+
+    # Block metadata for VRAM reduction methods
+    for i, block in enumerate(self.blocks):
+      block._block_idx = i
+      block._is_last_layer = i == cfg.n_layer - 1
+    if cfg.use_sqrt_ckpt:
+      from .sqrt_sac import get_sqrt_checkpoint_indices
+
+      indices = set(get_sqrt_checkpoint_indices(cfg.n_layer))
+      for i, block in enumerate(self.blocks):
+        block._use_checkpoint = i in indices
+
     self.final_norm = _make_rms_norm(cfg.n_embd, cfg)
     self.lm_head = nn.Linear(cfg.n_embd, cfg.vocab_size, bias=False)
 
@@ -236,10 +301,9 @@ class Model(nn.Module):
     else:
       rope_positions = None
       if targets is not None:
-        # Pre-doubled buffers: shape (1, 2*seq_len, 1, D/2). Slice to actual
-        # T=2L so smaller batches (L < seq_len) don't cause a shape mismatch.
-        cos = self.cos_2x[:, :T]
-        sin = self.sin_2x[:, :T]
+        L = targets.size(1)
+        cos = self.cos[:, :L]
+        sin = self.sin[:, :L]
       else:
         cos = self.cos[:, pos_offset : pos_offset + T]
         sin = self.sin[:, pos_offset : pos_offset + T]

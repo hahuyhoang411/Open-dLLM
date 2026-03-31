@@ -59,12 +59,23 @@ class Config:
   # --- Feature flags ---
   use_amp: bool = True
   use_liger: bool = True
+  use_liger_swiglu: bool = True
+  use_liger_rmsnorm: bool = True
   use_flce: bool = True
   use_flex: bool = True
   use_grad_ckpt: bool = False
   use_compile: bool = True
   use_muon: bool = True
   use_fp8: bool = False
+  use_fa_rope: bool = False  # flash-attn apply_rotary_emb (4x faster, auto-fallback)
+  use_gram_ns: bool = False  # gram-newton-schulz for Muon optimizer (5x batched)
+
+  # --- VRAM reduction methods ---
+  use_offload_ckpt: bool = False  # enable activation offloading (requires use_grad_ckpt)
+  offload_strategy: str = 'smart'  # 'simple' | 'smart' | 'compress'
+  use_tiled_mlp: bool = False  # chunked MLP to reduce intermediate memory
+  tiled_mlp_chunk: int = 0  # 0 = auto chunk size
+  use_sqrt_ckpt: bool = False  # sqrt checkpointing (fewer boundaries, less recompute)
 
   # --- Data ---
   # NOTE: Phase 5 data ('HoangHa/100BT-dLLM-pretokenized') uses vocab=49152 tokenizer.
@@ -226,12 +237,23 @@ def from_cli() -> Config:
   # Feature flags
   p.add_argument('--no-amp', action='store_true')
   p.add_argument('--no-liger', action='store_true')
+  p.add_argument('--no-liger-rmsnorm', action='store_true')
+  p.add_argument('--no-liger-swiglu', action='store_true')
   p.add_argument('--no-flce', action='store_true')
   p.add_argument('--no-flex', action='store_true')
   p.add_argument('--grad-ckpt', action='store_true')
   p.add_argument('--no-compile', action='store_true')
   p.add_argument('--no-muon', action='store_true')
   p.add_argument('--fp8', action='store_true')
+  p.add_argument('--fa-rope', action='store_true', help='Use flash-attn RoPE (4x faster)')
+  p.add_argument('--gram-ns', action='store_true', help='Use gram-newton-schulz for Muon (5x batched)')
+
+  # VRAM reduction
+  p.add_argument('--offload-ckpt', action='store_true', help='CPU offload for activation checkpoints')
+  p.add_argument('--offload-strategy', type=str, default='smart', choices=['simple', 'smart', 'compress'])
+  p.add_argument('--tiled-mlp', action='store_true', help='Chunked MLP forward/backward')
+  p.add_argument('--tiled-mlp-chunk', type=int, default=0, help='TiledMLP chunk size (0=auto)')
+  p.add_argument('--sqrt-ckpt', action='store_true', help='Sqrt checkpointing (fewer boundaries)')
 
   # Data
   p.add_argument(
@@ -295,12 +317,22 @@ def from_cli() -> Config:
     # Feature flags
     use_amp=not a.no_amp,
     use_liger=not a.no_liger,
+    use_liger_swiglu=not a.no_liger and not a.no_liger_swiglu,
+    use_liger_rmsnorm=not a.no_liger and not a.no_liger_rmsnorm,
     use_flce=not a.no_flce,
     use_flex=not a.no_flex,
     use_grad_ckpt=a.grad_ckpt,
     use_compile=not a.no_compile,
     use_muon=not a.no_muon,
     use_fp8=a.fp8,
+    use_fa_rope=a.fa_rope,
+    use_gram_ns=a.gram_ns,
+    # VRAM reduction
+    use_offload_ckpt=a.offload_ckpt,
+    offload_strategy=a.offload_strategy,
+    use_tiled_mlp=a.tiled_mlp,
+    tiled_mlp_chunk=a.tiled_mlp_chunk,
+    use_sqrt_ckpt=a.sqrt_ckpt,
     # Data
     data_dir=a.data_dir,
     # Checkpointing
@@ -362,9 +394,29 @@ def setup_features(cfg: Config) -> Config:
 
   has_cuda = torch.cuda.is_available()
   cfg.use_amp = cfg.use_amp and has_cuda
-  cfg.use_liger = cfg.use_liger and _check_liger()
+  liger_ok = _check_liger()
+  cfg.use_liger = cfg.use_liger and liger_ok
+  cfg.use_liger_swiglu = cfg.use_liger_swiglu and liger_ok
+  cfg.use_liger_rmsnorm = cfg.use_liger_rmsnorm and liger_ok
   cfg.use_flce = cfg.use_flce and _check_flce()
   cfg.use_flex = cfg.use_flex and _check_flex() and has_cuda
   cfg.use_compile = cfg.use_compile and has_cuda
   cfg.use_fp8 = cfg.use_fp8 and has_cuda
+  if cfg.use_fa_rope:
+    try:
+      from .attention import enable_fa_rope
+
+      enable_fa_rope()
+    except (ImportError, Exception):
+      cfg.use_fa_rope = False
+  if cfg.use_gram_ns:
+    try:
+      from .optim import enable_gram_ns
+
+      enable_gram_ns()
+    except (ImportError, Exception):
+      cfg.use_gram_ns = False
+  # VRAM: offload requires grad_ckpt
+  if cfg.use_offload_ckpt and not cfg.use_grad_ckpt:
+    cfg.use_grad_ckpt = True
   return cfg

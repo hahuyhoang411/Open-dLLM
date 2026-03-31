@@ -161,8 +161,8 @@ def estimate_step_tflops(cfg, wall_s: float) -> float:
   per_layer = qkv_flops + attn_qk + attn_v + out_proj + mlp_flops
   total_layer_flops = NL * per_layer
 
-  # LM head: h @ weight.T  (B*L, D) x (D, V)
-  lm_head_flops = 2 * B * L * D * V
+  # LM head: only processes x_pred = x[:, :seq_len] — the first half
+  lm_head_flops = 2 * B * cfg.seq_len * D * V
 
   fwd_flops = total_layer_flops + lm_head_flops
 
