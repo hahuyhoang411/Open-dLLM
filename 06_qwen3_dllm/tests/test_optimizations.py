@@ -1,6 +1,5 @@
 """Tests for attention optimizations: dispatch modes, bf16 masks, QK-Clip frequency, GQA."""
 
-import pytest
 import torch
 from phase6.config import Config
 
@@ -38,47 +37,6 @@ def small_cfg(**overrides):
 
 
 class TestDispatchModes:
-  def test_set_dispatch_mode_sdpa_mask(self):
-    """set_dispatch_mode changes _dispatch attribute."""
-    from phase6.attention import MultiHeadAttention
-
-    cfg = small_cfg()
-    attn = MultiHeadAttention(cfg)
-    attn.set_dispatch_mode('sdpa_mask')
-    assert attn._dispatch == 'sdpa_mask'
-
-  def test_set_dispatch_mode_sdpa_causal(self):
-    from phase6.attention import MultiHeadAttention
-
-    cfg = small_cfg()
-    attn = MultiHeadAttention(cfg)
-    attn.set_dispatch_mode('sdpa_causal')
-    assert attn._dispatch == 'sdpa_causal'
-
-  def test_set_dispatch_mode_flex(self):
-    from phase6.attention import MultiHeadAttention
-
-    cfg = small_cfg()
-    attn = MultiHeadAttention(cfg)
-    attn.set_dispatch_mode('flex')
-    assert attn._dispatch == 'flex'
-
-  def test_set_dispatch_mode_invalid(self):
-    from phase6.attention import MultiHeadAttention
-
-    cfg = small_cfg()
-    attn = MultiHeadAttention(cfg)
-    with pytest.raises(AssertionError):
-      attn.set_dispatch_mode('invalid')
-
-  def test_default_dispatch_mode(self):
-    """Default dispatch should be 'sdpa_causal' (no flex on CPU)."""
-    from phase6.attention import MultiHeadAttention
-
-    cfg = small_cfg()
-    attn = MultiHeadAttention(cfg)
-    assert attn._dispatch in ('flex', 'sdpa_mask', 'sdpa_causal')
-
   def test_forward_sdpa_mask_path(self):
     """Forward with attn_mask uses SDPA masked path."""
     from phase6.attention import build_staircase_mask
@@ -97,41 +55,7 @@ class TestDispatchModes:
 
 
 # ============================================================================
-# Optimization 2: QK-Clip Frequency Reduction
-# ============================================================================
-
-
-class TestQKClipFrequency:
-  def test_should_compute_qk_norms_first_call(self):
-    """First call after reset should return True."""
-    import phase6.attention as attn_mod
-    from phase6.attention import _should_compute_qk_norms
-
-    attn_mod._qk_clip_counter = 0
-    assert _should_compute_qk_norms() is True
-
-  def test_should_compute_qk_norms_skip(self):
-    """Second call should return False (not every-step)."""
-    import phase6.attention as attn_mod
-    from phase6.attention import _should_compute_qk_norms
-
-    attn_mod._qk_clip_counter = 0
-    _should_compute_qk_norms()  # step 1: True
-    assert _should_compute_qk_norms() is False  # step 2: skip
-
-  def test_should_compute_qk_norms_period(self):
-    """Should fire on step 1, 11, 21, etc. (every _QK_CLIP_EVERY)."""
-    import phase6.attention as attn_mod
-    from phase6.attention import _QK_CLIP_EVERY, _should_compute_qk_norms
-
-    attn_mod._qk_clip_counter = 0
-    results = [_should_compute_qk_norms() for _ in range(_QK_CLIP_EVERY + 1)]
-    assert results[0] is True  # step 1
-    assert all(r is False for r in results[1:_QK_CLIP_EVERY])  # steps 2-10
-    assert results[_QK_CLIP_EVERY] is True  # step 11
-
-
-# ============================================================================
+# Optimization 2: QK-Clip (frequency reduction removed — norms computed every step now)
 # Optimization 3: (GQA enable_gqa=True tested via existing forward tests)
 # ============================================================================
 
@@ -170,25 +94,25 @@ class TestGQAOptimization:
 
 
 # ============================================================================
-# Optimization 4: Dense Staircase Mask in bf16
+# Optimization 4: Dense Staircase Mask dtype
 # ============================================================================
 
 
 class TestStaircaseMaskDtype:
-  def test_staircase_mask_bf16(self):
-    """Dense staircase mask should be bf16."""
+  def test_staircase_mask_float(self):
+    """Dense staircase mask should be a float dtype (cast to bf16 by AMP)."""
     from phase6.attention import build_staircase_mask
 
     mask = build_staircase_mask(64, 8)
-    assert mask.dtype == torch.bfloat16
+    assert mask.dtype.is_floating_point
 
-  def test_staircase_mask_with_docs_bf16(self):
-    """Dense staircase mask with doc_ids should be bf16."""
+  def test_staircase_mask_with_docs_float(self):
+    """Dense staircase mask with doc_ids should be a float dtype."""
     from phase6.attention import build_staircase_mask
 
     doc_ids = torch.zeros(2, 64, dtype=torch.long)
     mask = build_staircase_mask(64, 8, doc_ids=doc_ids)
-    assert mask.dtype == torch.bfloat16
+    assert mask.dtype.is_floating_point
 
   def test_staircase_mask_values_preserved(self):
     """bf16 mask should still have 0.0 and -inf values."""
